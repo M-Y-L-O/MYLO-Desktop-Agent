@@ -39,7 +39,8 @@ def load_onnx_model(file_path:str):
             "inputs": [{"name": inp.name} for inp in graph.input],
             "outputs": [{"name": out.name} for out in graph.output],
             "nodes": node_summary,
-            "node_count": len(graph.node)
+            "node_count": len(graph.node),
+            "filename": file_path.split("/")[-1],
         }
 
         return {
