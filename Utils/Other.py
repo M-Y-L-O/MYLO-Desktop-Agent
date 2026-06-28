@@ -19,3 +19,11 @@ def make_json_serializable(obj):
         return obj.item()
     else:
         return obj
+
+import torch
+
+def getDevice():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    else:
+        return torch.device("cpu")

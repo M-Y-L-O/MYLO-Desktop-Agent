@@ -31,3 +31,10 @@ class ProjectData:
         self.modelFilepath=""
         self.name=""
         self.id=""
+
+class OptimizationRequest:
+    ecnoding = ""
+    strategy = ""
+    inputFeatures = []
+    targetFeature = ""
+    epochs = 0

@@ -1,5 +1,6 @@
 import os
 from tkinter import filedialog
+import pandas as pd
 
 from fastapi.params import File
 
@@ -22,3 +23,15 @@ async def saveFile(file:File, path:str = "temp_project"):
             f.write(chunk)
             
     return tempPath
+
+def loadData(path:str):
+    if os.path.exists(path):
+        return pd.read_csv(path)
+    else:
+        raise FileNotFoundError("Data file not found")
+    
+def readBinary(path:str):
+    if os.path.exists(path):
+        with open(path, 'rb') as file:
+            binary_data = file.read()
+            return binary_data

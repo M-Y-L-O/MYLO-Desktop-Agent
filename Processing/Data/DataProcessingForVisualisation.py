@@ -34,6 +34,12 @@ def analyseCsvData(df: pd.DataFrame)-> Dict[str, Any]:
     categoricalColumns, numericalColumns = getColumnTypes(df)
     encodingCheck = checkEncodingFeasibility(df, categoricalColumns=categoricalColumns, numericalColumns=numericalColumns)
 
+    return {
+        "categorical_columns": categoricalColumns,
+        "numerical_columns": numericalColumns,
+        "encoding_check": encodingCheck
+    }
+
 
 def getColumnTypes(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
     categoricalColumns = []

@@ -13,8 +13,8 @@ import shutil
 
 from Types.Types import *
 from Processing.ModelProcessing import load_onnx_model
-from Processing.DataProcessing import analyseCSV
-from Utils.FileHandler import saveFile
+from Processing.DataProcessingForVisualisation import analyseCSV
+from Utils.FileHandler import saveFile, loadData
 
 
 from tkinter import Tk
@@ -50,6 +50,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+queue = []
 
 # MIDDLEWARE
 
@@ -147,7 +149,6 @@ async def loadCsv(file: UploadFile = File(...)):
         global CurrentProject
 
         tempPath = await saveFile(file)
-
        
         if(CurrentProject.csvFilepath != ""):
             loadedCSV = os.path.join("temp_project", os.path.basename(CurrentProject.csvFilepath))
@@ -156,6 +157,7 @@ async def loadCsv(file: UploadFile = File(...)):
 
         CurrentProject.csvFilepath = tempPath
         CurrentProject.dumpInTemp()
+
         result = analyseCSV(tempPath)
 
         with open("temp_project/csvInfo.json", "w") as f:
@@ -164,6 +166,24 @@ async def loadCsv(file: UploadFile = File(...)):
         return JSONResponse(content=result)
     except Exception as e:
         return JSONResponse(content={"error": str(e)}, status_code=500)
+
+# Tools
+
+@app.post("/optimizeModel")
+async def optimizeModel(request: Request):
+    queue = []
+
+
+    inputFeatures = request.get("inputFeatures", [])
+    targetFeature = request.get("targetFeature", "")
+    epochs = request.get("epochs", 10)
+    encoding = request.get("encoding", "none")
+    strategy = request.get("strategy", "brute-force")
+
+    def statusCallback(status):
+        queue.append(status)
+
+    optimizeModel(CurrentProject, OptimizationRequest(encoding=encoding, strategy=strategy, inputFeatures=inputFeatures, targetFeature=targetFeature, epochs=epochs), statusCallback)
 
 #Project handling routes
 
@@ -209,8 +229,8 @@ async def getProject(Request: Request):
 
         projectData = {
             "name": CurrentProject.name,
-            "csvFilepath": CurrentProject.csvFilepath,
-            "modelFilepath": CurrentProject.modelFilepath,
+            "csvFile": os.path.basename(CurrentProject.csvFilepath) if CurrentProject.csvFilepath else "",
+            "modelFile": os.path.basename(CurrentProject.modelFilepath) if CurrentProject.modelFilepath else "",
             "id":CurrentProject.id
         }
 
