@@ -36,5 +36,5 @@ class OptimizationRequest:
     ecnoding = ""
     strategy = ""
     inputFeatures = []
-    targetFeature = ""
+    targetFeature = ""|[]
     epochs = 0

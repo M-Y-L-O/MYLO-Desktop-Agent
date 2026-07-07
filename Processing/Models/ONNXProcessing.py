@@ -70,36 +70,3 @@ def dummyShapeFromDescriptor(descriptor):
     
     return dummyShape
 
-def descriptorToOnnx(model, descriptor, outputPath, device=None):
-    if device is None:
-        device = torch.device("cpu")
-
-    modelCpu = model.to("cpu")
-    modelCpu.eval()
-
-    dummyShape = dummyShapeFromDescriptor(descriptor)
-    dummyInput = torch.randn(*dummyShape, dtype=torch.float32)
-
-    dynamicAxes = {
-        "input":{0:"batch_size"},
-        "output":{0:"batch_size"}
-    }
-
-    torch.onnx.export(
-        modelCpu,
-        dummyInput,
-        outputPath,
-        dynamic_axes=dynamicAxes,
-        opset_version=17,
-        do_constant_folding=True,
-        export_params=True,
-        training=torch.onnx.TrainingMode.EVAL,
-    )
-
-    
-    try:
-        onnx.checker.check_model(outputPath)
-        return {"success": True, "outputPath": outputPath}
-    except onnx.checker.ValidationError as e:
-        logging.exception("ONNX model validation failed")
-        return {"success": False, "error": str(e)}

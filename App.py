@@ -172,8 +172,6 @@ async def loadCsv(file: UploadFile = File(...)):
 @app.post("/optimizeModel")
 async def optimizeModel(request: Request):
     queue = []
-
-
     inputFeatures = request.get("inputFeatures", [])
     targetFeature = request.get("targetFeature", "")
     epochs = request.get("epochs", 10)

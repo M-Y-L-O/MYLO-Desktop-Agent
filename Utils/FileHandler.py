@@ -3,6 +3,7 @@ from tkinter import filedialog
 import pandas as pd
 
 from fastapi.params import File
+import tempfile
 
 def loadModel(path:str):
     if os.path.exists(path):
@@ -35,3 +36,10 @@ def readBinary(path:str):
         with open(path, 'rb') as file:
             binary_data = file.read()
             return binary_data
+        
+def createTempFile(fileBytes, extension):
+  with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_file:
+    temp_file.write(fileBytes)
+    temp_file_path = temp_file.name
+  
+  return temp_file_path
