@@ -6,14 +6,14 @@ import asyncio
 import concurrent.futures
 from Processing.Data.DataProcessingForTraining import encodeData, mapOriginalToEncodedColumns
 import torch
-from Data.DataPipeline import DataPipeline
+from Processing.Data.DataPipeline import DataPipeline
 from Processing.Models.DescriptorHandling import loadDescriptorFromBytes, descriptorToOnnx, extractStateDict
 import os
 from Core.AdaptedModel import AdaptedModel
 
-async def optimizeModel(project:ProjectData, requestInfo:OptimizationRequest, statusCalback):
+async def optimizeModel(project: ProjectData, requestInfo: OptimizationRequest, statusCalback):
     statusCalback({"status":"Processing request...", "progress":0})
-    data = loadData(project.csvFilepath)
+    data = loadData(os.path.join("temp_project", project.csvFilepath))
     statusCalback({"status":"Encoding data...", "progress":3})
     result = encodeData(data, requestInfo.encoding)
     encodedDf = result[0]
@@ -28,20 +28,31 @@ async def optimizeModel(project:ProjectData, requestInfo:OptimizationRequest, st
 
     isPytorchModel = project.modelFilepath.endswith(".pt") or project.modelFilepath.endswith(".pth") or project.modelFilepath.endswith(".pt2")
 
+    # Read separate weights bytes if a weights file was uploaded alongside a JSON descriptor
+    weightBytes = None
+    weightsPath = getattr(project, "weightsFilepath", None)
+    if weightsPath:
+        full_weights_path = os.path.join("temp_project", weightsPath)
+        if os.path.exists(full_weights_path):
+            weightBytes = readBinary(full_weights_path)
+
     statusCalback({"status":"Optimizing model...", "progress":10})
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
         result = await loop.run_in_executor(
             pool,
-            lambda: findOptimalArchitecture(project, encodedDf, requestInfo, isPytorchModel, statusCallback=statusCalback)
+            lambda: findOptimalArchitecture(project, encodedDf, requestInfo, isPytorchModel, statusCallback=statusCalback, weightBytes=weightBytes)
         )
     
-    if "modelPath" not in result:
+    if "model_path" not in result:
         return {"error": "Optimization failed", "details": result}
+
+    return result
 
 def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationRequest, isPytorchModel, statusCallback=None, weightBytes = None):
     try:
-        modelBytes = readBinary(project.modelFilepath)
+        
+        modelBytes = readBinary(os.path.join("temp_project", project.modelFilepath))
         device = getDevice()
 
         torch.set_num_threads(4)
@@ -78,10 +89,10 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
 
         statusCallback({"status": "Preparing leakage-free data pipeline...", "progress": 10})
         pipeline = DataPipeline.prepare_data(
-            project.csvFilepath,
+            os.path.join("temp_project", project.csvFilepath),
             featureCols,
             targetCol,
-            problem_type="regression",
+            problem_type=requestInfo.problem_type,
             batch_size=32 if device.type == "cpu" else min(128, max(32, len(df) // 8)),
             sequence_length=sequence_length,
         )
@@ -114,6 +125,8 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
             max_epochs=requestInfo.epochs,
             device=str(device),
             parent_state_dict=parent_state_dict,
+            problem_type=requestInfo.problem_type,
+            complexity_penalty=1e-7,
         )
 
         expected_input = best_descriptor.input_shape[-1]
@@ -133,7 +146,8 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
         output_dir = "temp_project"
         config_path = os.path.join(output_dir, "model_config.json")
         weights_path = os.path.join(output_dir, "model_weights.pth")
-        onnx_path =  project.modelFilepath.split(".")[0] + "_optimized.onnx"
+        bundle_path = os.path.join(output_dir, "optimized_model.pt2")
+        onnx_path = os.path.join(output_dir, "optimized_model.onnx")
 
         with open(config_path, "w", encoding="utf-8") as config_file:
             config_file.write(best_descriptor.to_json())
@@ -146,7 +160,6 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
             weights_path,
         )
 
-        bundle_path = os.path.join(output_dir, "optimized_model.pt2")
         torch.save(
             {
                 "state_dict": best_model.state_dict(),
@@ -156,7 +169,7 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
         )
 
         try:
-            onnx_path = descriptorToOnnx(best_model, best_descriptor, output_dir, device=device)
+            onnx_path = descriptorToOnnx(best_model, best_descriptor, onnx_path, device=device)
         except Exception as export_error:
             onnx_path = None
 

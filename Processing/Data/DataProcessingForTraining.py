@@ -1,4 +1,4 @@
-from DataProcessingForVisualisation import getColumnTypes
+from Processing.Data.DataProcessingForVisualisation import getColumnTypes
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder
 
@@ -68,7 +68,7 @@ def mapOriginalToEncodedColumns(originalColumns, encodingMetadata, encodedDf):
     for col in originalColumns:
         if col in encodedDf.columns:
             mappedColumns.append(col)
-        elif col in encodingMetadata["encoders", {}]:
+        elif col in encodingMetadata.get("encoders", {}):
             encoderInfo = encodingMetadata["encoders"][col]
             if encoderInfo.get("encoder") == "one-hot":
                 dummyCols = encoderInfo.get("new_columns", [])

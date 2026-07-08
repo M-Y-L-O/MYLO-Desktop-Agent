@@ -3,3 +3,5 @@ Lib/
 Include/
 temp_export/
 temp_project/
+__pycache__/
+*.pyc

@@ -69,6 +69,131 @@ class NodeRegistry:
         cls.register("BatchNorm1d", nn.BatchNorm1d, {"num_features": "num_features"})
         cls.register("BatchNorm2d", nn.BatchNorm2d, {"num_features": "num_features"})
 
+        class Add(nn.Module):
+            def forward(self, x):
+                return x
+
+        class Concat(nn.Module):
+            def __init__(self, dim: int = -1):
+                super().__init__()
+                self.dim = dim
+
+            def forward(self, x):
+                return x
+
+        cls.register("Add", Add, {}, execution_op="merge_add")
+        cls.register("Concat", Concat, {"dim": "dim"}, execution_op="merge_concat")
+
+        class Unsqueeze(nn.Module):
+            def __init__(self, dim: int = 0):
+                super().__init__()
+                self.dim = dim
+
+            def forward(self, x):
+                return torch.unsqueeze(x, self.dim)
+
+        cls.register("Unsqueeze", Unsqueeze, {"dim": "dim"})
+
+        class Squeeze(nn.Module):
+            def __init__(self, dim: int | None = None):
+                super().__init__()
+                self.dim = dim
+
+            def forward(self, x):
+                if self.dim is None:
+                    return torch.squeeze(x)
+                return torch.squeeze(x, self.dim)
+
+        cls.register("Squeeze", Squeeze, {"dim": "dim"})
+
+        class ReduceMean(nn.Module):
+            def __init__(self, dim=None, keepdim: bool = False):
+                super().__init__()
+                self.dim = dim
+                self.keepdim = keepdim
+
+            def forward(self, x):
+                if self.dim is None:
+                    dims = tuple(range(1, x.dim()))
+                    return torch.mean(x, dim=dims, keepdim=self.keepdim)
+                if isinstance(self.dim, (list, tuple)):
+                    return torch.mean(x, dim=tuple(self.dim), keepdim=self.keepdim)
+                return torch.mean(x, dim=self.dim, keepdim=self.keepdim)
+
+        cls.register("ReduceMean", ReduceMean, {"dim": "dim", "keepdim": "keepdim", "axes": "dim"})
+
+        class Transpose(nn.Module):
+            def __init__(self, dim0: int, dim1: int):
+                super().__init__()
+                self.dim0 = dim0
+                self.dim1 = dim1
+
+            def forward(self, x):
+                return torch.transpose(x, self.dim0, self.dim1)
+
+        cls.register("Transpose", Transpose, {"dim0": "dim0", "dim1": "dim1"})
+
+        class Permute(nn.Module):
+            def __init__(self, dims):
+                super().__init__()
+                self.dims = tuple(dims)
+
+            def forward(self, x):
+                return x.permute(*self.dims)
+
+        cls.register("Permute", Permute, {"dims": "dims"})
+
+        class Reshape(nn.Module):
+            def __init__(self, target_shape=None, **kwargs):
+                super().__init__()
+                self.target_shape = tuple(target_shape) if target_shape is not None else None
+
+            def forward(self, x):
+                if self.target_shape is None:
+                    return x
+                batch_size = x.shape[0]
+                return x.reshape(batch_size, *self.target_shape)
+
+        cls.register("Identity", nn.Identity, {})
+        cls.register("Reshape", Reshape, {"target_shape": "target_shape"})
+        cls.register("LayerNorm", nn.LayerNorm, {"normalized_shape": "normalized_shape", "eps": "eps", "elementwise_affine": "elementwise_affine"})
+        cls.register("Embedding", nn.Embedding, {"num_embeddings": "num_embeddings", "embedding_dim": "embedding_dim", "padding_idx": "padding_idx"})
+        cls.register("ConvTranspose1d", nn.ConvTranspose1d, {"in_channels": "in_channels", "out_channels": "out_channels", "kernel_size": "kernel_size", "stride": "stride", "padding": "padding"})
+        cls.register("ConvTranspose2d", nn.ConvTranspose2d, {"in_channels": "in_channels", "out_channels": "out_channels", "kernel_size": "kernel_size", "stride": "stride", "padding": "padding"})
+        cls.register("MaxPool1d", nn.MaxPool1d, {"kernel_size": "kernel_size", "stride": "stride", "padding": "padding"})
+        cls.register("AvgPool1d", nn.AvgPool1d, {"kernel_size": "kernel_size", "stride": "stride", "padding": "padding"})
+        cls.register("MaxPool2d", nn.MaxPool2d, {"kernel_size": "kernel_size", "stride": "stride", "padding": "padding"})
+        cls.register("AvgPool2d", nn.AvgPool2d, {"kernel_size": "kernel_size", "stride": "stride", "padding": "padding"})
+
+        class TransformerEncoderLayer(nn.Module):
+            def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1, batch_first: bool = True, norm_first: bool = False, **kwargs):
+                super().__init__()
+                self.layer = nn.TransformerEncoderLayer(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout,
+                    batch_first=batch_first,
+                    norm_first=norm_first,
+                    **kwargs,
+                )
+
+            def forward(self, x):
+                return self.layer(x)
+
+        cls.register(
+            "TransformerEncoderLayer",
+            TransformerEncoderLayer,
+            {
+                "d_model": "d_model",
+                "nhead": "nhead",
+                "dim_feedforward": "dim_feedforward",
+                "dropout": "dropout",
+                "batch_first": "batch_first",
+                "norm_first": "norm_first",
+            },
+        )
+
         class SelfAttention(nn.Module):
             def __init__(self, embed_dim: int, num_heads: int, batch_first: bool = True, **kwargs):
                 super().__init__()
@@ -90,5 +215,5 @@ class NodeRegistry:
             execution_op="self_attention",
         )
 
-# Initialize defaults
+# defaults
 NodeRegistry._register_defaults()

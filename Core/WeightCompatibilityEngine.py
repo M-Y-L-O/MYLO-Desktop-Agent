@@ -30,7 +30,7 @@ class WeightCompatibilityEngine:
                     if target_key in unmatched_target:
                         unmatched_target.remove(target_key)
                 else:
-                    # Smart partial transfer for structural changes (e.g. grown layers)
+                    # Smart partial transfer for structural changes
                     transferred = WeightCompatibilityEngine._partial_shape_transfer(src_tensor, tgt_tensor)
                     if transferred is not None:
                         new_state_dict[target_key] = transferred

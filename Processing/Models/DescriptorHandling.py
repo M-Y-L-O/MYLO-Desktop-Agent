@@ -13,18 +13,20 @@ def descriptorToOnnx(model, descriptor, outputPath, device=None):
     modelCpu = model.to("cpu")
     modelCpu.eval()
 
-    dummyShape = dummyShapeFromDescriptor(descriptor)
+    dummyShape = dummyShapeFromDescriptor(descriptor.input_shape)
     dummyInput = torch.randn(*dummyShape, dtype=torch.float32)
 
     dynamicAxes = {
-        "input":{0:"batch_size"},
-        "output":{0:"batch_size"}
+        "input": {0: "batch_size"},
+        "output": {0: "batch_size"},
     }
 
     torch.onnx.export(
         modelCpu,
         dummyInput,
         outputPath,
+        input_names=["input"],
+        output_names=["output"],
         dynamic_axes=dynamicAxes,
         opset_version=17,
         do_constant_folding=True,
@@ -32,13 +34,9 @@ def descriptorToOnnx(model, descriptor, outputPath, device=None):
         training=torch.onnx.TrainingMode.EVAL,
     )
 
-    
-    try:
-        onnx.checker.check_model(outputPath)
-        return {"success": True, "outputPath": outputPath}
-    except onnx.checker.ValidationError as e:
-        return {"success": False, "error": str(e)}
-    
+    onnx.checker.check_model(outputPath)
+    return outputPath
+
 def dummyShapeFromDescriptor(input_shape):
     dummy_shape = []
     for index, dim in enumerate(input_shape):

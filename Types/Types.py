@@ -18,6 +18,7 @@ class ProjectData:
         data = {
             "csvFilepath": self.csvFilepath,
             "modelFilepath": self.modelFilepath,
+            "weightsFilepath": self.weightsFilepath,
             "name": self.name,
             "id":self.id
         }
@@ -27,14 +28,17 @@ class ProjectData:
             json.dump(data, f)
 
     def __init__(self):
-        self.csvFilepath=""
-        self.modelFilepath=""
-        self.name=""
-        self.id=""
+        self.csvFilepath = ""
+        self.modelFilepath = ""
+        self.weightsFilepath = ""
+        self.name = ""
+        self.id = ""
 
 class OptimizationRequest:
-    ecnoding = ""
-    strategy = ""
-    inputFeatures = []
-    targetFeature = ""|[]
-    epochs = 0
+    def __init__(self, encoding="", strategy="", inputFeatures=None, targetFeature="", epochs=0, problem_type="regression"):
+        self.encoding = encoding
+        self.strategy = strategy
+        self.inputFeatures = list(inputFeatures or [])
+        self.targetFeature = targetFeature
+        self.epochs = epochs
+        self.problem_type = problem_type

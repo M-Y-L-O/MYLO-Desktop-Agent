@@ -77,6 +77,12 @@ class DataPipeline:
         """
         df = pd.read_csv(csv_path)
 
+        if problem_type not in ("regression", "classification"):
+            raise ValueError("problem_type must be 'regression' or 'classification'")
+
+        if problem_type == "classification" and len(target_cols) != 1:
+            raise ValueError("Classification currently supports exactly one target column.")
+
         missing_features = [c for c in feature_cols if c not in df.columns]
         missing_targets = [c for c in target_cols if c not in df.columns]
         if missing_features:
@@ -85,7 +91,8 @@ class DataPipeline:
             raise ValueError(f"Missing target columns in CSV: {missing_targets}")
 
         df[feature_cols] = df[feature_cols].fillna(df[feature_cols].mean(numeric_only=True)).fillna(0.0)
-        df[target_cols] = df[target_cols].fillna(df[target_cols].mean(numeric_only=True)).fillna(0.0)
+        if problem_type == "regression":
+            df[target_cols] = df[target_cols].fillna(df[target_cols].mean(numeric_only=True)).fillna(0.0)
 
         if sequence_length is not None:
             # Chronological split to preserve temporal continuity for sequence data
@@ -104,13 +111,30 @@ class DataPipeline:
         val_x = scaler_x.transform(val_df[feature_cols].values)
 
         scaler_y = None
+        target_encoder = None
         if problem_type == "regression":
             scaler_y = StandardScaler()
             train_y = scaler_y.fit_transform(train_df[target_cols].values)
             val_y = scaler_y.transform(val_df[target_cols].values)
         else:
-            train_y = train_df[target_cols].values
-            val_y = val_df[target_cols].values
+            target_col = target_cols[0]
+            target_mode = df[target_col].mode(dropna=True)
+            fill_value = target_mode.iloc[0] if not target_mode.empty else "_MISSING_"
+
+            train_target_series = train_df[target_col].fillna(fill_value)
+            val_target_series = val_df[target_col].fillna(fill_value)
+
+            categories = pd.Index(pd.unique(pd.concat([train_target_series, val_target_series], ignore_index=True)))
+            if len(categories) < 2:
+                raise ValueError("Classification requires at least two target classes.")
+
+            class_to_index = {value: index for index, value in enumerate(categories.tolist())}
+            train_y = train_target_series.map(class_to_index).to_numpy(dtype="int64")
+            val_y = val_target_series.map(class_to_index).to_numpy(dtype="int64")
+            target_encoder = {
+                "classes": categories.tolist(),
+                "class_to_index": class_to_index,
+            }
 
         train_features = torch.tensor(train_x, dtype=torch.float32)
         val_features = torch.tensor(val_x, dtype=torch.float32)
@@ -128,12 +152,15 @@ class DataPipeline:
             input_shape = [-1, sequence_length, len(feature_cols)]
         else:
             input_shape = [-1, len(feature_cols)]
-        output_shape = [-1, len(target_cols)]
+        if problem_type == "classification":
+            output_shape = [-1, len(target_encoder["classes"])]
+        else:
+            output_shape = [-1, len(target_cols)]
 
         return DataPipelineResult(
             train_loader=train_loader,
             val_loader=val_loader,
-            scalers={"x": scaler_x, "y": scaler_y},
+            scalers={"x": scaler_x, "y": scaler_y, "target_encoder": locals().get("target_encoder")},
             input_shape=input_shape,
             output_shape=output_shape,
         )
