@@ -35,10 +35,9 @@ class ProjectData:
         self.id = ""
 
 class OptimizationRequest:
-    def __init__(self, encoding="", strategy="", inputFeatures=None, targetFeature="", epochs=0, problem_type="regression"):
-        self.encoding = encoding
-        self.strategy = strategy
-        self.inputFeatures = list(inputFeatures or [])
-        self.targetFeature = targetFeature
-        self.epochs = epochs
-        self.problem_type = problem_type
+    encoding = ""
+    strategy = ""
+    inputFeatures = []
+    targetFeature = ""|[]
+    epochs = 0
+    generations = 5

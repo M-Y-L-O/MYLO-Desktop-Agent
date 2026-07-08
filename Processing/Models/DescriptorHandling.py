@@ -49,7 +49,6 @@ def dummyShapeFromDescriptor(input_shape):
     return dummy_shape
 
 def descriptorToGraph(descriptor):
-    """Generate graph visualization from descriptor."""
     nodes = [
         {"id": "input", "label": "input", "title": json.dumps({"shape": descriptor.input_shape}, indent=2), "group": "input"},
         {"id": "output", "label": "output", "title": json.dumps({"shape": descriptor.output_shape}, indent=2), "group": "output"},

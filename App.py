@@ -10,6 +10,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import uvicorn
 
+import json
+from zipfile import ZipFile, ZIP_DEFLATED
+import shutil
+
+from Processing.Optimization.Optimizing import startOptimization
 from Types.Types import *
 from Processing.Models.ONNXProcessing import analyseOnnx as load_onnx_model
 from Processing.Models.DescriptorHandling import loadDescriptorFromBytes, descriptorToGraph
@@ -230,7 +235,13 @@ async def loadCsv(file: UploadFile = File(...)):
 
 @app.post("/optimizeModel")
 async def optimizeModel(request: Request):
-    global CurrentProject
+    queue = []
+    inputFeatures = request.get("inputFeatures", [])
+    targetFeature = request.get("targetFeature", "")
+    epochs = request.get("epochs", 10)
+    encoding = request.get("encoding", "none")
+    strategy = request.get("strategy", "brute-force")
+    generations = request.get("generations", 5)
 
     if CurrentProject.modelFilepath.endswith(".onnx"):
         return JSONResponse({"error": "ONNX optimization disabled"}, 400)
@@ -241,18 +252,7 @@ async def optimizeModel(request: Request):
     def callback(status):
         queue.append(status)
 
-    result = await runOptimizationModel(
-        CurrentProject,
-        OptimizationRequest(
-            encoding=body.get("encoding", "none"),
-            strategy=body.get("strategy", "brute-force"),
-            inputFeatures=body.get("inputFeatures", []),
-            targetFeature=body.get("targetFeature", ""),
-            epochs=body.get("epochs", 10),
-            problem_type=body.get("problem_type", "regression"),
-        ),
-        callback,
-    )
+    startOptimization(CurrentProject, OptimizationRequest(encoding=encoding, strategy=strategy, inputFeatures=inputFeatures, targetFeature=targetFeature, epochs=epochs, generations=generations), statusCallback)
 
     return JSONResponse({"status_updates": queue, "result": result})
 

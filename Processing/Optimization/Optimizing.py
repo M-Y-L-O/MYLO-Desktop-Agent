@@ -11,7 +11,7 @@ from Processing.Models.DescriptorHandling import loadDescriptorFromBytes, descri
 import os
 from Core.AdaptedModel import AdaptedModel
 
-async def optimizeModel(project: ProjectData, requestInfo: OptimizationRequest, statusCalback):
+async def startOptimization(project:ProjectData, requestInfo:OptimizationRequest, statusCalback):
     statusCalback({"status":"Processing request...", "progress":0})
     data = loadData(os.path.join("temp_project", project.csvFilepath))
     statusCalback({"status":"Encoding data...", "progress":3})
@@ -121,7 +121,7 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
         best_descriptor, best_model = engine.evolve(
             train_loader=pipeline.train_loader,
             val_loader=pipeline.val_loader,
-            generations=max(2, 5),
+            generations=max(2, requestInfo.generations),
             max_epochs=requestInfo.epochs,
             device=str(device),
             parent_state_dict=parent_state_dict,
@@ -184,7 +184,7 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
             "summary": {
                 "strategy_used": "neuroevolution",
                 "requested_strategy": requestInfo.strategy,
-                "generations": max(2, 5),
+                "generations": max(2, requestInfo.generations),
                 "population_size": population_size,
                 "input_features": featureCols,
                 "output_features": targetCol,
