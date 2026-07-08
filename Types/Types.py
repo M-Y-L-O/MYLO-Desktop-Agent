@@ -38,6 +38,6 @@ class OptimizationRequest:
     encoding = ""
     strategy = ""
     inputFeatures = []
-    targetFeature = ""|[]
+    targetFeature = []
     epochs = 0
     generations = 5

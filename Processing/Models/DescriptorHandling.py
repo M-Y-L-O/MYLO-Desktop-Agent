@@ -67,16 +67,36 @@ def descriptorToGraph(descriptor):
         })
 
     edges = [
-        {"from": edge.source, "to": edge.target, "label": f"{getattr(edge, 'source_port', '')}→{getattr(edge, 'target_port', '')}"}
+        {"from": edge.source, "to": edge.target}
         for edge in descriptor.edges
     ]
 
+    node_summary = []
+    node_summary.append({
+        "name": "input",
+        "op_type": "Input",
+    })
+    for node in descriptor.nodes:
+        node_summary.append({
+            "name": node.id if node.id else "Unnamed",
+            "op_type": node.type,
+        })
+    node_summary.append({
+        "name": "output",
+        "op_type": "Output",
+    })
+
     summary = {
-        "format": "pt2_descriptor_bundle",
+        "ir_version": None,
+        "producer": "descriptor",
+        "inputs": [{"name": "input"}],
+        "outputs": [{"name": "output"}],
+        "nodes": node_summary,
+        "node_count": len(node_summary),
+        "filename": f"{descriptor.model_name}.json" if descriptor.model_name else "descriptor.json",
         "model_name": descriptor.model_name,
         "input_shape": descriptor.input_shape,
         "output_shape": descriptor.output_shape,
-        "node_count": len(descriptor.nodes),
         "edge_count": len(descriptor.edges),
     }
 

@@ -16,10 +16,9 @@ import shutil
 
 from Processing.Optimization.Optimizing import startOptimization
 from Types.Types import *
-from Processing.Models.ONNXProcessing import analyseOnnx as load_onnx_model
-from Processing.Models.DescriptorHandling import loadDescriptorFromBytes, descriptorToGraph
+from Processing.Models.ModelProcessing import analyseModel
 from Processing.Data.DataProcessingForVisualisation import analyseCSV
-from Processing.Optimization.Optimizing import optimizeModel as runOptimizationModel
+from Processing.Optimization.Optimizing import startOptimization
 from Utils.FileHandler import saveFile
 
 
@@ -50,41 +49,6 @@ app.add_middleware(
 
 def project_path(filename: str) -> str:
     return os.path.join("temp_project", filename)
-
-
-def try_extract_descriptor(model_bytes: bytes, is_pytorch: bool):
-    try:
-        return loadDescriptorFromBytes(
-            model_bytes=model_bytes,
-            is_pytorch=is_pytorch,
-            input_dim=1,
-            output_dim=1
-        )
-    except Exception:
-        return None
-
-
-def parse_model_file(filename: str, model_bytes: bytes, weights_present: bool):
-    if filename.endswith(".onnx"):
-        return "onnx", None
-
-    if filename.endswith(".pt2"):
-        descriptor = try_extract_descriptor(model_bytes, True)
-        if not descriptor:
-            raise ValueError("Invalid .pt2 descriptor")
-        return "descriptor", descriptor
-
-    if weights_present:
-        descriptor = try_extract_descriptor(model_bytes, False)
-        return "descriptor", descriptor
-
-    if filename.endswith((".pt", ".pth")):
-        descriptor = try_extract_descriptor(model_bytes, True)
-        if descriptor:
-            return "descriptor", descriptor
-        return "raw_pytorch", None
-
-    raise ValueError(f"Unsupported model format: {filename}")
 
 
 # ---------------- MIDDLEWARE ----------------
@@ -176,22 +140,18 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
         CurrentProject.dumpInTemp()
 
         full_model_path = project_path(model_name)
+        weights_full_path = ""
+        if getattr(CurrentProject, "weightsFilepath", ""):
+            weights_full_path = project_path(CurrentProject.weightsFilepath)
 
-        with open(full_model_path, "rb") as f:
-            model_bytes = f.read()
+        result = analyseModel(
+            full_model_path,
+            originalFilename=file.filename,
+            weightsPath=weights_full_path,
+        )
 
-        mode, descriptor = parse_model_file(file.filename.lower(), model_bytes, weightsFile is not None)
-
-        if mode == "onnx":
-            result = load_onnx_model(full_model_path)
-
-        elif mode == "descriptor":
-            if not descriptor:
-                raise ValueError("Descriptor extraction failed")
-            result = descriptorToGraph(descriptor)
-
-        else:
-            result = {"type": "raw_pytorch", "warning": "Limited visualization"}
+        if isinstance(result, dict) and "error" in result:
+            raise ValueError(result["error"])
 
         with open(project_path("modelInfo.json"), "w") as f:
             json.dump(result, f)
@@ -246,13 +206,10 @@ async def optimizeModel(request: Request):
     if CurrentProject.modelFilepath.endswith(".onnx"):
         return JSONResponse({"error": "ONNX optimization disabled"}, 400)
 
-    body = await request.json()
-    queue = []
-
     def callback(status):
         queue.append(status)
 
-    startOptimization(CurrentProject, OptimizationRequest(encoding=encoding, strategy=strategy, inputFeatures=inputFeatures, targetFeature=targetFeature, epochs=epochs, generations=generations), statusCallback)
+    result = await startOptimization(CurrentProject, OptimizationRequest(encoding=encoding, strategy=strategy, inputFeatures=inputFeatures, targetFeature=targetFeature, epochs=epochs, generations=generations), callback)
 
     return JSONResponse({"status_updates": queue, "result": result})
 
