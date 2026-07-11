@@ -106,6 +106,43 @@ def descriptorToGraph(descriptor):
         "summary": make_json_serializable(summary),
     }
 
+def descriptorToDetailedGraph(descriptor):
+    """Generate a detailed graph visualization from descriptor by exporting to ONNX and analyzing."""
+    import tempfile
+    from Core.DescriptorModelBuilder import DescriptorModelBuilder
+    from Processing.Models.ONNXProcessing import analyseOnnx
+
+    try:
+        model = DescriptorModelBuilder.build(descriptor)
+    except Exception as e:
+        logging.error(f"Failed to build model from descriptor for detailed visualization: {e}")
+        return {"error": f"Failed to build model: {str(e)}"}
+        
+    temp_fd, temp_path = tempfile.mkstemp(suffix=".onnx")
+    os.close(temp_fd)
+    
+    try:
+        descriptorToOnnx(model, descriptor, temp_path)
+        result = analyseOnnx(temp_path)
+        
+        # Override the filename in the summary to match the descriptor's name if available
+        if "summary" in result and "filename" in result["summary"]:
+            model_name = getattr(descriptor, "model_name", None)
+            if not model_name:
+                model_name = "descriptor_model"
+            result["summary"]["filename"] = f"{model_name}.onnx"
+            
+        return result
+    except Exception as e:
+        logging.exception(f"Failed to export descriptor to ONNX for detailed graph visualization: {e}")
+        return {"error": str(e)}
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
 def loadDescriptorFromBytes(model_bytes, is_pytorch: bool, input_dim: int, output_dim: int):
     from Core.ArchitectureDescriptor import ArchitectureDescriptor
 

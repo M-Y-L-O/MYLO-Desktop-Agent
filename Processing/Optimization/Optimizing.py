@@ -158,17 +158,17 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
 
         statusCallback({"status": "Starting neuroevolution...", "progress": 20})
         population_size = min(20, max(4, requestInfo.epochs * 4))
-        engine = NeuroevolutionEngine(initialDescriptor, population_size=population_size, statusCallback=statusCallback)
-        best_descriptor, best_model = engine.evolve(
-            train_loader=pipeline.train_loader,
-            val_loader=pipeline.val_loader,
-            generations=max(2, requestInfo.generations),
-            max_epochs=requestInfo.epochs,
-            device=str(device),
-            parent_state_dict=parent_state_dict,
-            problem_type=problem_type,
-            complexity_penalty=1e-7,
-        )
+        engine = NeuroevolutionEngine(initialDescriptor, population_size=population_size)
+        best_descriptor, best_model, diagnostics = engine.evolve(
+    train_loader=pipeline.train_loader,
+    val_loader=pipeline.val_loader,
+    generations=max(2, requestInfo.epochs), 
+    max_epochs=requestInfo.epochs,
+    device=str(device),
+    parent_state_dict=parent_state_dict,
+    problem_type=requestInfo.problem_type,
+    complexity_penalty=1e-7,
+)
 
         expected_input = best_descriptor.input_shape[-1]
         actual_input = pipeline.input_shape[-1]
@@ -216,23 +216,25 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
 
         statusCallback({"status": "Optimization complete", "progress": 100})
         return {
-            "status": "success",
-            "model_path": bundle_path,
-            "model_config_path": config_path,
-            "model_weights_path": weights_path,
-            "model_onnx_path": onnx_path,
-            "onnx_exported": onnx_path is not None,
-            "summary": {
-                "strategy_used": "neuroevolution",
-                "requested_strategy": requestInfo.strategy,
-                "generations": max(2, requestInfo.generations),
-                "population_size": population_size,
-                "input_features": featureCols,
-                "output_features": targetCol,
-            },
-            "best_config": best_descriptor.to_dict(),
-        }
-
+    "status": "success",
+    "model_path": bundle_path,
+    "model_config_path": config_path,
+    "model_weights_path": weights_path,
+    "model_onnx_path": onnx_path,
+    "onnx_exported": onnx_path is not None,
+    "summary": {
+        "strategy_used": "neuroevolution",
+        "requested_strategy": requestInfo.strategy,
+        "generations": max(2, requestInfo.epochs),
+        "population_size": population_size,
+        "input_features": featureCols,
+        "output_features": targetCol,
+    },
+    "best_config": best_descriptor.to_dict(),
+    "original_descriptor": diagnostics["original_descriptor"],  # <-- NEW
+    "optimization_diagnostics": diagnostics,  # <-- NEW
+}
+        
     except Exception as e:
         statusCallback({"status": f"Error: {str(e)}", "error": True, "progress": 0})
         return {"error": str(e)}

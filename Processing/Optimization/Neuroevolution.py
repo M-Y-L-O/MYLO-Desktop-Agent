@@ -3,17 +3,62 @@ import json
 import random
 import os
 import tempfile
-from typing import List, Dict, Any, Tuple, Optional
+import logging
+from typing import List, Dict, Any, Tuple, Optional, Set
+from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 from Core.ArchitectureDescriptor import ArchitectureDescriptor, Node, Edge
 from Core.DescriptorModelBuilder import DescriptorModelBuilder
 from Core.WeightCompatibilityEngine import WeightCompatibilityEngine
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class GenerationStats:
+    """Track per-generation statistics for diagnostics."""
+    generation: int
+    tier1_survivors: int = 0
+    tier2_survivors: int = 0
+    mutation_attempts: int = 0
+    mutation_successes: int = 0
+    best_train_loss: float = float("inf")
+    best_val_loss: float = float("inf")
+    best_score: float = float("inf")
+    avg_tier1_score: float = float("inf")
+    structural_mutations: int = 0  # add/remove/skip
+    width_mutations: int = 0
+    activation_mutations: int = 0
+
+    def mutation_success_rate(self) -> float:
+        if self.mutation_attempts == 0:
+            return 0.0
+        return self.mutation_successes / self.mutation_attempts
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "generation": self.generation,
+            "tier1_survivors": self.tier1_survivors,
+            "tier2_survivors": self.tier2_survivors,
+            "mutation_attempts": self.mutation_attempts,
+            "mutation_successes": self.mutation_successes,
+            "mutation_success_rate": f"{self.mutation_success_rate():.1%}",
+            "best_train_loss": round(self.best_train_loss, 6),
+            "best_val_loss": round(self.best_val_loss, 6),
+            "best_score": round(self.best_score, 6),
+            "avg_tier1_score": round(self.avg_tier1_score, 6),
+            "structural_mutations": self.structural_mutations,
+            "width_mutations": self.width_mutations,
+            "activation_mutations": self.activation_mutations,
+        }
+
 
 class MutationGrammar:
     MAX_NODES = 64
     MAX_DEPTH = 16
+    WIDTH_FACTORS = [0.5, 0.8, 1.2, 1.5, 2.0]
 
     @staticmethod
     def scale_width(descriptor: ArchitectureDescriptor, target_node_id: str, factor: float) -> bool:
@@ -45,7 +90,6 @@ class MutationGrammar:
         node.params[param_to_scale] = new_out
 
         descriptor.normalize_inplace()
-
         return True
 
     @staticmethod
@@ -65,7 +109,7 @@ class MutationGrammar:
         if not after_node:
             return False
 
-        if new_node_type == after_node.type and new_node_type != "Linear":
+        if new_node_type == after_node.type and new_node_type not in ["Linear", "Identity"]:
             return False
 
         outgoing_edges = [e for e in descriptor.edges if e.source == after_node_id]
@@ -73,24 +117,27 @@ class MutationGrammar:
             return False
 
         new_node_id = f"{new_node_type.lower()}_add_{random.randint(1000, 9999)}"
-        out_dim = (
-            after_node.params.get("out_features")
-            or after_node.params.get("out_channels")
-            or after_node.params.get("hidden_size")
-            or after_node.params.get("normalized_shape")
-            or 64
-        )
-        if isinstance(out_dim, (list, tuple)):
-            out_dim = out_dim[-1] if out_dim else 64
+
+        out_dim = None
+        for key in ["out_features", "out_channels", "hidden_size", "normalized_shape", "num_features"]:
+            if key in after_node.params:
+                val = after_node.params[key]
+                if val is not None and (not isinstance(val, (list, tuple)) or len(val) > 0):
+                    out_dim = val[-1] if isinstance(val, (list, tuple)) else val
+                    if out_dim and out_dim > 0:
+                        break
+
+        if out_dim is None or out_dim <= 0:
+            out_dim = 64
 
         if new_node_type == "Linear":
-            if out_dim is None:
-                return False
             new_params = {"in_features": out_dim, "out_features": max(1, int(out_dim // 2))}
         elif new_node_type == "Dropout":
             new_params = {"p": 0.1}
         elif new_node_type == "LayerNorm":
             new_params = {"normalized_shape": out_dim}
+        elif new_node_type in ["BatchNorm1d", "BatchNorm2d"]:
+            new_params = {"num_features": out_dim}
         elif new_node_type == "Identity":
             new_params = {}
         elif new_node_type in ["ReLU", "Tanh", "Sigmoid"]:
@@ -111,17 +158,46 @@ class MutationGrammar:
         return True
 
     @staticmethod
+    def remove_layer(descriptor: ArchitectureDescriptor, target_node_id: str) -> bool:
+        """Remove a node and reconnect its parents directly to its children."""
+        node = next((n for n in descriptor.nodes if n.id == target_node_id), None)
+        if not node:
+            return False
+
+        if node.id in ["input", "output"]:
+            return False
+
+        incoming = [e for e in descriptor.edges if e.target == target_node_id]
+        outgoing = [e for e in descriptor.edges if e.source == target_node_id]
+
+        if not incoming or not outgoing:
+            return False
+
+        if len(incoming) == 1 and node.type not in ["Add", "Concat"]:
+            parent = incoming[0].source
+            children = [e.target for e in outgoing]
+
+            descriptor.nodes = [n for n in descriptor.nodes if n.id != target_node_id]
+            descriptor.edges = [e for e in descriptor.edges if e.source != target_node_id and e.target != target_node_id]
+
+            for child in children:
+                descriptor.edges.append(Edge(source=parent, target=child))
+
+            descriptor.normalize_inplace()
+            return True
+
+        return False
+
+    @staticmethod
     def add_skip_connection(
         descriptor: ArchitectureDescriptor,
         from_id: str,
         to_id: str,
     ) -> bool:
-        
-        # add a skip (residual) connection from from_id → to_id.
+        """Add a skip connection from from_id -> to_id using Concat merge."""
         node_ids = {n.id for n in descriptor.nodes}
         if from_id not in node_ids or to_id not in node_ids:
             return False
-
         if from_id == to_id:
             return False
 
@@ -133,10 +209,8 @@ class MutationGrammar:
         if any(edge.source == from_id and edge.target == to_id for edge in descriptor.edges):
             return False
 
-        # Guard against creating cycles: to_id must not be an ancestor of from_id
-        # (simple reachability check in existing graph)
         def reachable(start: str, goal: str) -> bool:
-            visited: set = set()
+            visited: Set[str] = set()
             stack = [start]
             while stack:
                 curr = stack.pop()
@@ -151,7 +225,7 @@ class MutationGrammar:
             return False
 
         if reachable(to_id, from_id):
-            return False  # Would create a cycle
+            return False
 
         incoming_edges = [edge for edge in descriptor.edges if edge.target == to_id]
         if not incoming_edges:
@@ -160,14 +234,13 @@ class MutationGrammar:
         concat_id = f"concat_{random.randint(1000, 9999)}"
         descriptor.nodes.append(Node(id=concat_id, type="Concat", params={"dim": -1}))
 
-        for edge in incoming_edges:
-            edge.target = concat_id
+        main_edge = max(incoming_edges, key=lambda e: levels.get(e.source, -1))
+        main_edge.target = concat_id
 
         descriptor.edges.append(Edge(source=from_id, target=concat_id))
         descriptor.edges.append(Edge(source=concat_id, target=to_id))
 
         descriptor.normalize_inplace()
-
         return True
 
     @staticmethod
@@ -207,38 +280,49 @@ class MutationGrammar:
         return len(descriptor.nodes) <= MutationGrammar.MAX_NODES and MutationGrammar._graph_depth(descriptor) <= MutationGrammar.MAX_DEPTH
 
     @staticmethod
-    def apply_random_mutation(descriptor: ArchitectureDescriptor) -> bool:
-        
+    def apply_random_mutation(descriptor: ArchitectureDescriptor, stats: Optional[GenerationStats] = None) -> bool:
+        """Apply a random mutation with proper rollback on failure."""
+        original_nodes = copy.deepcopy(descriptor.nodes)
+        original_edges = copy.deepcopy(descriptor.edges)
+
         candidates = []
         width_nodes = [n.id for n in descriptor.nodes if n.type in ["Linear", "Conv1d", "LSTM", "GRU"]]
         layer_nodes = [n.id for n in descriptor.nodes if n.type in ["Linear", "Conv1d"]]
         activation_nodes = [n.id for n in descriptor.nodes if n.type in ["ReLU", "Tanh", "Sigmoid"]]
 
-        # Use default-argument capture to avoid late-binding closure bug
+        removable = [n.id for n in descriptor.nodes if n.type not in ["Add", "Concat"] 
+                     and n.id not in ["input", "output"]
+                     and any(e.target == n.id for e in descriptor.edges)
+                     and any(e.source == n.id for e in descriptor.edges)]
+
         if width_nodes:
             def _scale(desc=descriptor, nodes=list(width_nodes)):
                 return MutationGrammar.scale_width(
                     desc,
                     random.choice(nodes),
-                    random.choice([0.5, 0.8, 1.2, 1.5, 2.0]),
+                    random.choice(MutationGrammar.WIDTH_FACTORS),
                 )
-            candidates.append(_scale)
+            candidates.append(("width", _scale))
 
         if layer_nodes:
             def _add_layer(desc=descriptor, nodes=list(layer_nodes)):
                 return MutationGrammar.add_layer(
                     desc,
                     random.choice(nodes),
-                    random.choice(["ReLU", "Dropout"]),
+                    random.choice(["ReLU", "Dropout", "Linear"]),
                 )
-            candidates.append(_add_layer)
+            candidates.append(("structural", _add_layer))
 
         if activation_nodes:
             def _mutate_act(desc=descriptor, nodes=list(activation_nodes)):
                 return MutationGrammar.mutate_activation(desc, random.choice(nodes))
-            candidates.append(_mutate_act)
+            candidates.append(("activation", _mutate_act))
 
-        # Skip connection: pick two non-adjacent nodes
+        if removable:
+            def _remove(desc=descriptor, nodes=list(removable)):
+                return MutationGrammar.remove_layer(desc, random.choice(nodes))
+            candidates.append(("structural", _remove))
+
         if len(width_nodes) >= 2:
             valid_pairs = []
             levels = MutationGrammar._topological_levels(descriptor)
@@ -258,20 +342,39 @@ class MutationGrammar:
                 def _skip(desc=descriptor, pairs=list(valid_pairs)):
                     from_id, to_id = random.choice(pairs)
                     return MutationGrammar.add_skip_connection(desc, from_id, to_id)
-
-                candidates.append(_skip)
+                candidates.append(("structural", _skip))
 
         random.shuffle(candidates)
-        for mutator in candidates:
+
+        if stats:
+            stats.mutation_attempts += len(candidates)
+
+        for mut_type, mutator in candidates:
             try:
                 if mutator():
                     descriptor.normalize_inplace()
                     if not MutationGrammar._within_limits(descriptor):
+                        descriptor.nodes = copy.deepcopy(original_nodes)
+                        descriptor.edges = copy.deepcopy(original_edges)
                         continue
                     descriptor.validate()
+                    if stats:
+                        stats.mutation_successes += 1
+                        if mut_type == "structural":
+                            stats.structural_mutations += 1
+                        elif mut_type == "width":
+                            stats.width_mutations += 1
+                        elif mut_type == "activation":
+                            stats.activation_mutations += 1
                     return True
-            except (ValueError, Exception):
+            except (ValueError, Exception) as e:
+                logger.debug(f"Mutation attempt failed: {type(e).__name__}: {e}")
+                descriptor.nodes = copy.deepcopy(original_nodes)
+                descriptor.edges = copy.deepcopy(original_edges)
                 continue
+
+        descriptor.nodes = copy.deepcopy(original_nodes)
+        descriptor.edges = copy.deepcopy(original_edges)
         return False
 
 
@@ -316,7 +419,6 @@ class TieredEvaluator:
         criterion,
         device: str = "cpu",
     ) -> float:
-        #evaluare
         model.to(device)
         model.eval()
         total_loss = 0.0
@@ -365,12 +467,15 @@ class NeuroevolutionEngine:
         self.population_size = population_size
         self.statusCallback = statusCallback
         self.population: List[Tuple[ArchitectureDescriptor, Optional[Dict[str, torch.Tensor]]]] = []
+        self._stagnation_counter = 0
+        self._best_score_history: List[float] = []
+        self.generation_stats: List[GenerationStats] = []
+        self.original_descriptor_json: str = initial_descriptor.to_json()
 
     def initialize_population(
         self,
         parent_state_dict: Optional[Dict[str, torch.Tensor]] = None,
     ):
-        #populare
         self.population = [(copy.deepcopy(self.initial_descriptor), parent_state_dict)]
         attempts = 0
         max_attempts = self.population_size * 10
@@ -381,7 +486,6 @@ class NeuroevolutionEngine:
             if MutationGrammar.apply_random_mutation(child):
                 self.population.append((child, parent_state_dict))
 
-        # copii nemodificate daca nu s-au generat destule mutatii
         while len(self.population) < self.population_size:
             self.population.append((copy.deepcopy(self.initial_descriptor), parent_state_dict))
 
@@ -403,6 +507,12 @@ class NeuroevolutionEngine:
     def _score(loss: float, model: nn.Module, complexity_penalty: float) -> float:
         return loss + (complexity_penalty * NeuroevolutionEngine._model_complexity(model))
 
+    def _is_stagnant(self, window: int = 3) -> bool:
+        if len(self._best_score_history) < window + 1:
+            return False
+        recent = self._best_score_history[-window:]
+        return all(abs(recent[i] - recent[i-1]) < 1e-6 for i in range(1, len(recent)))
+
     def evolve(
         self,
         train_loader,
@@ -414,16 +524,17 @@ class NeuroevolutionEngine:
         criterion: Optional[nn.Module] = None,
         problem_type: str = "regression",
         complexity_penalty: float = 1e-7,
-    ) -> Tuple[ArchitectureDescriptor, nn.Module]:
+    ) -> Tuple[ArchitectureDescriptor, nn.Module, Dict[str, Any]]:
         """
-        Run tiered neuroevolution and return (best_descriptor, best_model).
+        Run tiered neuroevolution and return (best_descriptor, best_model, diagnostics).
 
-        Tier 1: quick 1-epoch screen of the full population.
-        Tier 2: 10-epoch evaluation of the top quartile.
-        Finals: full max_epochs training of the top 2.
-
-        Args:
-            criterion: Loss function. Defaults to MSELoss (regression).
+        The diagnostics dict contains:
+        - original_descriptor: the architecture before optimization
+        - generation_stats: per-generation metrics
+        - best_train_loss: best training loss achieved
+        - best_val_loss: best validation loss achieved (if val_loader provided)
+        - total_mutations_attempted: sum across all gens
+        - total_mutations_succeeded: sum across all gens
         """
         self.initialize_population(parent_state_dict)
 
@@ -434,8 +545,12 @@ class NeuroevolutionEngine:
         best_descriptor = copy.deepcopy(self.initial_descriptor)
         best_model = self._build_model_with_weights(best_descriptor, parent_state_dict)
         best_score = float("inf")
+        best_train_loss = float("inf")
+        best_val_loss = float("inf")
 
         for gen in range(generations):
+            stats = GenerationStats(generation=gen + 1)
+
             # ── Tier 1: 1-epoch screen ──────────────────────────────────────
             tier1_results = []
             for desc, parent_state in self.population:
@@ -444,7 +559,7 @@ class NeuroevolutionEngine:
                     model = self._build_model_with_weights(desc, parent_state)
                     model.to(device)
                     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-                    loss = TieredEvaluator.evaluate(
+                    train_loss = TieredEvaluator.evaluate(
                         model,
                         train_loader,
                         criterion,
@@ -452,17 +567,24 @@ class NeuroevolutionEngine:
                         num_epochs=TieredEvaluator.TIER1_EPOCHS,
                         device=device,
                     )
-                    score = self._score(loss, model, complexity_penalty)
-                    tier1_results.append((desc, parent_state, loss, score, model))
-                except Exception:
+                    score = self._score(train_loss, model, complexity_penalty)
+                    tier1_results.append((desc, parent_state, train_loss, score, model))
+                except Exception as e:
+                    logger.debug(f"Tier 1 eval failed: {type(e).__name__}: {e}")
                     continue
 
             if not tier1_results:
+                logger.warning(f"Generation {gen + 1}: No survivors in Tier 1")
+                self.generation_stats.append(stats)
                 continue
 
             tier1_results.sort(key=lambda item: item[3])
+            stats.tier1_survivors = len(tier1_results)
+            stats.avg_tier1_score = sum(item[3] for item in tier1_results) / len(tier1_results)
+            stats.best_train_loss = tier1_results[0][2]
+            stats.best_score = tier1_results[0][3]
 
-            # ── Tier 2: 10-epoch eval of top quartile ───────────────────────
+            # ── Tier 2: 10-epoch eval of top candidates ───────────────────────
             tier2_count = max(2, self.population_size // 10)
             tier2_results = []
 
@@ -470,7 +592,7 @@ class NeuroevolutionEngine:
                 try:
                     model.to(device)
                     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-                    loss = TieredEvaluator.evaluate(
+                    train_loss = TieredEvaluator.evaluate(
                         model,
                         eval_loader,
                         criterion,
@@ -478,12 +600,14 @@ class NeuroevolutionEngine:
                         num_epochs=TieredEvaluator.TIER2_EPOCHS,
                         device=device,
                     )
-                    score = self._score(loss, model, complexity_penalty)
-                    tier2_results.append((desc, parent_state, loss, score, model))
-                except Exception:
+                    score = self._score(train_loss, model, complexity_penalty)
+                    tier2_results.append((desc, parent_state, train_loss, score, model))
+                except Exception as e:
+                    logger.debug(f"Tier 2 eval failed: {type(e).__name__}: {e}")
                     continue
 
             tier2_results.sort(key=lambda item: item[3])
+            stats.tier2_survivors = len(tier2_results)
             finalists = tier2_results[:2] if tier2_results else tier1_results[:2]
 
             # ── Finals: full training of top 2 ──────────────────────────────
@@ -491,7 +615,7 @@ class NeuroevolutionEngine:
                 try:
                     model.to(device)
                     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-                    loss = TieredEvaluator.evaluate(
+                    train_loss = TieredEvaluator.evaluate(
                         model,
                         eval_loader,
                         criterion,
@@ -499,21 +623,42 @@ class NeuroevolutionEngine:
                         num_epochs=max(max_epochs, TieredEvaluator.TIER2_EPOCHS),
                         device=device,
                     )
+
+                    # ── FIX: Always compute validation loss separately ──
                     val_loss = TieredEvaluator.validate(model, eval_loader, criterion, device=device)
-                    effective_loss = val_loss if val_loader else loss
+
+                    # If val_loader is None, we're validating on train_loader (overfit warning)
+                    effective_loss = val_loss if val_loader is not None else train_loss
                     effective_score = self._score(effective_loss, model, complexity_penalty)
 
                     if effective_score < best_score:
                         best_score = effective_score
                         best_descriptor = copy.deepcopy(desc)
                         best_model = model
-                except Exception:
+                        best_train_loss = train_loss
+                        best_val_loss = val_loss
+                        logger.info(f"Gen {gen + 1} new best: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}, score={effective_score:.6f}")
+                except Exception as e:
+                    logger.debug(f"Finals eval failed: {type(e).__name__}: {e}")
                     continue
 
-            # ── Reproducere: elites + mutated offspring ────────────────────────
+            stats.best_train_loss = best_train_loss
+            stats.best_val_loss = best_val_loss
+            stats.best_score = best_score
+            self._best_score_history.append(best_score)
+            self.generation_stats.append(stats)
+
+            # ── Reproduction: elites + mutated offspring ────────────────────────
             elite_count = max(2, self.population_size // 10)
             elite = tier1_results[:elite_count]
-            new_population = [(copy.deepcopy(item[0]), item[4].state_dict()) for item in elite]
+
+            new_population = []
+            for item in elite:
+                elite_desc = copy.deepcopy(item[0])
+                elite_sd = item[4].state_dict()
+                if random.random() < 0.5:
+                    MutationGrammar.apply_random_mutation(elite_desc, stats)
+                new_population.append((elite_desc, elite_sd))
 
             attempts = 0
             max_attempts = self.population_size * 10
@@ -523,14 +668,46 @@ class NeuroevolutionEngine:
                 parent_desc = elite_choice[0]
                 parent_sd = elite_choice[4].state_dict()
                 child = copy.deepcopy(parent_desc)
-                if MutationGrammar.apply_random_mutation(child):
+                if MutationGrammar.apply_random_mutation(child, stats):
                     new_population.append((child, parent_sd))
 
-            # Padding
+            # ── Stagnation recovery ──────────────────────────────────────────
+            if self._is_stagnant(window=2):
+                logger.info(f"Stagnation detected at generation {gen + 1}. Injecting diversity.")
+                inject_count = max(2, self.population_size // 5)
+                for _ in range(inject_count):
+                    if len(new_population) >= self.population_size:
+                        break
+                    fresh = copy.deepcopy(self.initial_descriptor)
+                    for _ in range(random.randint(2, 3)):
+                        MutationGrammar.apply_random_mutation(fresh, stats)
+                    new_population.append((fresh, parent_state_dict))
+
             while len(new_population) < self.population_size:
                 new_population.append((copy.deepcopy(self.initial_descriptor), parent_state_dict))
 
             self.population = new_population
-            if self.statusCallback:
-                self.statusCallback({"status": f"Generation {gen + 1} complete. Best Score: {best_score:.6f}", "progress": 20 + ((gen+1) * 0.7)})
-        return best_descriptor, best_model
+            logger.info(
+                f"Generation {gen + 1} complete. "
+                f"Best Score: {best_score:.6f} | "
+                f"Mutations: {stats.mutation_successes}/{stats.mutation_attempts} succeeded | "
+                f"Structural: {stats.structural_mutations}, Width: {stats.width_mutations}, Act: {stats.activation_mutations}"
+            )
+
+        # ── Build diagnostics ───────────────────────────────────────────────
+        diagnostics = {
+            "original_descriptor": json.loads(self.original_descriptor_json),
+            "generation_stats": [s.to_dict() for s in self.generation_stats],
+            "best_train_loss": round(best_train_loss, 6),
+            "best_val_loss": round(best_val_loss, 6),
+            "best_score": round(best_score, 6),
+            "total_mutation_attempts": sum(s.mutation_attempts for s in self.generation_stats),
+            "total_mutation_successes": sum(s.mutation_successes for s in self.generation_stats),
+            "overall_mutation_success_rate": f"{sum(s.mutation_successes for s in self.generation_stats) / max(1, sum(s.mutation_attempts for s in self.generation_stats)):.1%}",
+            "used_validation_set": val_loader is not None,
+            "stagnation_events": sum(1 for i in range(2, len(self._best_score_history)) 
+                                     if abs(self._best_score_history[i] - self._best_score_history[i-1]) < 1e-6 
+                                     and abs(self._best_score_history[i-1] - self._best_score_history[i-2]) < 1e-6),
+        }
+
+        return best_descriptor, best_model, diagnostics
