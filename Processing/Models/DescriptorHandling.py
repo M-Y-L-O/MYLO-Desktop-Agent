@@ -35,6 +35,7 @@ def descriptorToOnnx(model, descriptor, outputPath, device=None):
     )
 
     onnx.checker.check_model(outputPath)
+    print(f"ONNX model exported to {outputPath}")
     return outputPath
 
 def dummyShapeFromDescriptor(input_shape):

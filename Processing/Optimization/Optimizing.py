@@ -208,10 +208,11 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             },
             bundle_path,
         )
-
+        onnx_path = os.path.join(output_dir, project.modelFilepath.split(".")[0] + "_optimized.onnx")
         try:
-            onnx_path = descriptorToOnnx(best_model, best_descriptor, onnx_path, device=device)
-        except Exception:
+            descriptorToOnnx(best_model, best_descriptor, onnx_path, device=device)
+        except Exception as e:
+            print("ONNX export failed. Continuing without ONNX export. " + str(e))
             onnx_path = None
 
         statusCallback({"status": "Optimization complete", "progress": 100})
