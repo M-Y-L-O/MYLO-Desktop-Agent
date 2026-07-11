@@ -1,5 +1,5 @@
 from Processing.Optimization.Neuroevolution import NeuroevolutionEngine
-from Types.Types import *
+from Types.Types import ProjectData, OptimizationRequest
 from Utils.FileHandler import loadData, readBinary
 from Utils.Other import getDevice
 import asyncio
@@ -11,66 +11,111 @@ from Processing.Models.DescriptorHandling import loadDescriptorFromBytes, descri
 import os
 from Core.AdaptedModel import AdaptedModel
 
-async def startOptimization(project:ProjectData, requestInfo:OptimizationRequest, statusCalback):
-    statusCalback({"status":"Processing request...", "progress":0})
-    data = loadData(os.path.join("temp_project", project.csvFilepath))
-    statusCalback({"status":"Encoding data...", "progress":3})
+
+def _repo_root() -> str:
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def _temp_project_path(filename: str) -> str:
+    if not filename:
+        return os.path.join(_repo_root(), "temp_project")
+
+    if os.path.isabs(filename):
+        return filename
+
+    return os.path.join(_repo_root(), "temp_project", filename)
+
+
+async def startOptimization(project: ProjectData, requestInfo: OptimizationRequest, statusCallback):
+    statusCallback = statusCallback or (lambda *_args, **_kwargs: None)
+    print(requestInfo)
+
+    if not project.csvFilepath:
+        return {"error": "CSV file is missing from the current project"}
+
+    if not project.modelFilepath:
+        return {"error": "Model file is missing from the current project"}
+
+    csv_path = _temp_project_path(project.csvFilepath)
+    model_path = _temp_project_path(project.modelFilepath)
+
+    if not os.path.exists(csv_path):
+        return {"error": f"Data file not found: {csv_path}"}
+
+    if not os.path.exists(model_path):
+        return {"error": f"Model file not found: {model_path}"}
+
+    statusCallback({"status": "Processing request...", "progress": 0})
+    data = loadData(csv_path)
+
+    statusCallback({"status": "Encoding data...", "progress": 3})
     result = encodeData(data, requestInfo.encoding)
     encodedDf = result[0]
     encodedMetadata = result[1]
 
+    targetFeature = requestInfo.targetFeature if isinstance(requestInfo.targetFeature, list) else [requestInfo.targetFeature]
     mappedInputFeatures = mapOriginalToEncodedColumns(requestInfo.inputFeatures, encodedMetadata, encodedDf)
-    mappedTargetFeature = mapOriginalToEncodedColumns([requestInfo.targetFeature], encodedMetadata, encodedDf)[0]
+    mappedTargetFeature = mapOriginalToEncodedColumns(targetFeature, encodedMetadata, encodedDf)
 
-    statusCalback({"status":"Loading model...", "progress":5})
+    statusCallback({"status": "Loading model...", "progress": 5})
     requestInfo.inputFeatures = mappedInputFeatures
     requestInfo.targetFeature = mappedTargetFeature
 
-    isPytorchModel = project.modelFilepath.endswith(".pt") or project.modelFilepath.endswith(".pth") or project.modelFilepath.endswith(".pt2")
+    isPytorchModel = model_path.endswith(".pt") or model_path.endswith(".pth") or model_path.endswith(".pt2")
 
-    # Read separate weights bytes if a weights file was uploaded alongside a JSON descriptor
     weightBytes = None
     weightsPath = getattr(project, "weightsFilepath", None)
     if weightsPath:
-        full_weights_path = os.path.join("temp_project", weightsPath)
+        full_weights_path = _temp_project_path(weightsPath)
         if os.path.exists(full_weights_path):
             weightBytes = readBinary(full_weights_path)
 
-    statusCalback({"status":"Optimizing model...", "progress":10})
+    statusCallback({"status": "Optimizing model...", "progress": 10})
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
         result = await loop.run_in_executor(
             pool,
-            lambda: findOptimalArchitecture(project, encodedDf, requestInfo, isPytorchModel, statusCallback=statusCalback, weightBytes=weightBytes)
+            lambda: findOptimalArchitecture(
+                project,
+                encodedDf,
+                requestInfo,
+                isPytorchModel,
+                statusCallback=statusCallback,
+                weightBytes=weightBytes,
+            ),
         )
-    
+
     if "model_path" not in result:
         return {"error": "Optimization failed", "details": result}
 
     return result
 
-def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationRequest, isPytorchModel, statusCallback=None, weightBytes = None):
+
+def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationRequest, isPytorchModel, statusCallback=None, weightBytes=None):
+    statusCallback = statusCallback or (lambda *_args, **_kwargs: None)
+
     try:
-        
-        modelBytes = readBinary(os.path.join("temp_project", project.modelFilepath))
+        model_path = _temp_project_path(project.modelFilepath)
+        modelBytes = readBinary(model_path)
         device = getDevice()
 
         torch.set_num_threads(4)
 
         if df is None or df.empty:
             return {"error": "Encoded DataFrame is empty"}
-        
+
         if modelBytes is None or len(modelBytes) == 0:
             return {"error": "Model bytes are empty"}
-        
-        statusCallback({"status":"Analasying model...", "progress":15})
-        
+
+        statusCallback({"status": "Analysing model...", "progress": 15})
+
         featureCols = requestInfo.inputFeatures
         targetCol = requestInfo.targetFeature if isinstance(requestInfo.targetFeature, list) else [requestInfo.targetFeature]
         inputDim = len(featureCols)
         outputDim = len(targetCol)
+        problem_type = getattr(requestInfo, "problem_type", "regression")
 
-        statusCallback({"status":"Loading architecture descriptor...", "progress":20})
+        statusCallback({"status": "Loading architecture descriptor...", "progress": 20})
         initialDescriptor = loadDescriptorFromBytes(modelBytes, isPytorchModel, inputDim, outputDim)
         parent_state_dict = None
         if weightBytes is not None:
@@ -79,20 +124,16 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
         elif isPytorchModel:
             parent_state_dict = extractStateDict(modelBytes, isPytorchModel)
 
-
-        
-
-        # Detect sequence_length if model expects 3D inputs [batch, sequence_length, features]
         sequence_length = None
         if len(initialDescriptor.input_shape) == 3:
             sequence_length = initialDescriptor.input_shape[1]
 
         statusCallback({"status": "Preparing leakage-free data pipeline...", "progress": 10})
         pipeline = DataPipeline.prepare_data(
-            os.path.join("temp_project", project.csvFilepath),
+            _temp_project_path(project.csvFilepath),
             featureCols,
             targetCol,
-            problem_type=requestInfo.problem_type,
+            problem_type=problem_type,
             batch_size=32 if device.type == "cpu" else min(128, max(32, len(df) // 8)),
             sequence_length=sequence_length,
         )
@@ -117,7 +158,7 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
 
         statusCallback({"status": "Starting neuroevolution...", "progress": 20})
         population_size = min(20, max(4, requestInfo.epochs * 4))
-        engine = NeuroevolutionEngine(initialDescriptor, population_size=population_size)
+        engine = NeuroevolutionEngine(initialDescriptor, population_size=population_size, statusCallback=statusCallback)
         best_descriptor, best_model = engine.evolve(
             train_loader=pipeline.train_loader,
             val_loader=pipeline.val_loader,
@@ -125,7 +166,7 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
             max_epochs=requestInfo.epochs,
             device=str(device),
             parent_state_dict=parent_state_dict,
-            problem_type=requestInfo.problem_type,
+            problem_type=problem_type,
             complexity_penalty=1e-7,
         )
 
@@ -143,7 +184,7 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
             )
 
         statusCallback({"status": "Saving optimized model bundle...", "progress": 90})
-        output_dir = "temp_project"
+        output_dir = _temp_project_path("")
         config_path = os.path.join(output_dir, "model_config.json")
         weights_path = os.path.join(output_dir, "model_weights.pth")
         bundle_path = os.path.join(output_dir, "optimized_model.pt2")
@@ -170,7 +211,7 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
 
         try:
             onnx_path = descriptorToOnnx(best_model, best_descriptor, onnx_path, device=device)
-        except Exception as export_error:
+        except Exception:
             onnx_path = None
 
         statusCallback({"status": "Optimization complete", "progress": 100})
@@ -191,9 +232,9 @@ def findOptimalArchitecture(project:ProjectData, df, requestInfo:OptimizationReq
             },
             "best_config": best_descriptor.to_dict(),
         }
-        
+
     except Exception as e:
         statusCallback({"status": f"Error: {str(e)}", "error": True, "progress": 0})
         return {"error": str(e)}
-    
-        
+
+

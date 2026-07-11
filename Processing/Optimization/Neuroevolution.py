@@ -360,9 +360,10 @@ class TieredEvaluator:
 
 
 class NeuroevolutionEngine:
-    def __init__(self, initial_descriptor: ArchitectureDescriptor, population_size: int = 20):
+    def __init__(self, initial_descriptor: ArchitectureDescriptor, population_size: int = 20, statusCallback: Optional[callable] = None):
         self.initial_descriptor = initial_descriptor
         self.population_size = population_size
+        self.statusCallback = statusCallback
         self.population: List[Tuple[ArchitectureDescriptor, Optional[Dict[str, torch.Tensor]]]] = []
 
     def initialize_population(
@@ -530,6 +531,6 @@ class NeuroevolutionEngine:
                 new_population.append((copy.deepcopy(self.initial_descriptor), parent_state_dict))
 
             self.population = new_population
-            print(f"Generation {gen + 1} complete. Best Score: {best_score:.6f}")
-
+            if self.statusCallback:
+                self.statusCallback({"status": f"Generation {gen + 1} complete. Best Score: {best_score:.6f}", "progress": 20 + ((gen+1) * 0.7)})
         return best_descriptor, best_model

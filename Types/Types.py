@@ -41,3 +41,11 @@ class OptimizationRequest:
     targetFeature = []
     epochs = 0
     generations = 5
+
+    def __init__(self, encoding="", strategy="", inputFeatures=None, targetFeature=None, epochs=0, generations=5):
+        self.encoding = encoding
+        self.strategy = strategy
+        self.inputFeatures = inputFeatures if inputFeatures is not None else []
+        self.targetFeature = targetFeature if targetFeature is not None else []
+        self.epochs = epochs
+        self.generations = generations

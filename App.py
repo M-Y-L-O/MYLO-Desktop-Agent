@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import shutil
@@ -5,7 +6,7 @@ from typing import Optional
 from zipfile import ZipFile, ZIP_DEFLATED
 
 from fastapi import FastAPI, Request, UploadFile, File
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import uvicorn
@@ -26,8 +27,10 @@ from Utils.FileHandler import saveFile
 
 CurrentSession = SessionData()
 CurrentProject = ProjectData()
+queue = []
+optimizing = False
 
-MIDDLEWARE_EXCEPTIONS = ["/", "/initialize", "/docs", "/openapi.json"]
+MIDDLEWARE_EXCEPTIONS = ["/", "/initialize", "/docs", "/openapi.json", "/optimizationStatus"]
 
 load_dotenv()
 
@@ -50,7 +53,19 @@ app.add_middleware(
 def project_path(filename: str) -> str:
     return os.path.join("temp_project", filename)
 
+def loadProjectData():
+    global CurrentProject
+    if not CurrentProject.id and os.path.exists(project_path("projectInfo.json")):
+        with open(project_path("projectInfo.json")) as f:
+            data = json.load(f)
+            CurrentProject.name = data.get("name", "")
+            CurrentProject.id = data.get("id", "")
+            CurrentProject.csvFilepath = data.get("csvFilepath", "")
+            CurrentProject.modelFilepath = data.get("modelFilepath", "")
+            if "weightsFilepath" in data:
+                CurrentProject.weightsFilepath = data.get("weightsFilepath")
 
+loadProjectData()
 # ---------------- MIDDLEWARE ----------------
 
 @app.middleware("http")
@@ -195,13 +210,22 @@ async def loadCsv(file: UploadFile = File(...)):
 
 @app.post("/optimizeModel")
 async def optimizeModel(request: Request):
+    global CurrentProject, queue, optimizing
+
+    if optimizing:
+        return JSONResponse({"error": "Optimization already in progress"}, 400)
+
+    optimizing = True
+    loadProjectData()
+
     queue = []
-    inputFeatures = request.get("inputFeatures", [])
-    targetFeature = request.get("targetFeature", "")
-    epochs = request.get("epochs", 10)
-    encoding = request.get("encoding", "none")
-    strategy = request.get("strategy", "brute-force")
-    generations = request.get("generations", 5)
+    body = await request.json()
+    inputFeatures = body.get("inputFeatures", [])
+    targetFeature = body.get("targetFeature", [])
+    epochs = body.get("epochs", 10)
+    encoding = body.get("encoding", "none")
+    strategy = body.get("strategy", "brute-force")
+    generations = body.get("generations", 5)
 
     if CurrentProject.modelFilepath.endswith(".onnx"):
         return JSONResponse({"error": "ONNX optimization disabled"}, 400)
@@ -210,9 +234,25 @@ async def optimizeModel(request: Request):
         queue.append(status)
 
     result = await startOptimization(CurrentProject, OptimizationRequest(encoding=encoding, strategy=strategy, inputFeatures=inputFeatures, targetFeature=targetFeature, epochs=epochs, generations=generations), callback)
-
+    optimizing = False
     return JSONResponse({"status_updates": queue, "result": result})
 
+@app.get("/optimizationStatus")
+async def optimizationStatus(request: Request):
+    global queue, optimizing
+    if not optimizing:
+        return JSONResponse({"status": "No optimization in progress"})
+    
+    async def statusGenerator():
+        while True:
+            if await request.is_disconnected():
+                break
+            if queue:
+                message = queue.pop(0)
+                yield f"data: {json.dumps(message)}\n\n"
+            await asyncio.sleep(0.1)
+
+    return StreamingResponse(statusGenerator(), media_type="text/event-stream")
 
 # ---------------- PROJECT ----------------
 
@@ -248,16 +288,10 @@ async def newProject(request: Request):
 async def getProject():
     global CurrentProject
 
-    if not CurrentProject.id and os.path.exists(project_path("projectInfo.json")):
-        with open(project_path("projectInfo.json")) as f:
-            data = json.load(f)
-            CurrentProject.name = data.get("name", "")
-            CurrentProject.id = data.get("id", "")
-            CurrentProject.csvFilepath = data.get("csvFilepath", "")
-            CurrentProject.modelFilepath = data.get("modelFilepath", "")
-            if "weightsFilepath" in data:
-                CurrentProject.weightsFilepath = data.get("weightsFilepath")
+    loadProjectData()
 
+    
+    
     modelData = {}
     csvData = {}
 
