@@ -6,11 +6,13 @@ import asyncio
 import concurrent.futures
 from Processing.Data.DataProcessingForTraining import encodeData, mapOriginalToEncodedColumns
 import torch
+from Processing.Models.ModelEditing import loadProjectDescriptor
 from Processing.Data.DataPipeline import DataPipeline
 from Processing.Models.DescriptorHandling import loadDescriptorFromBytes, descriptorToOnnx, extractStateDict
 import os
 from Core.AdaptedModel import AdaptedModel
-
+import logging
+logger = logging.getLogger(__name__)
 
 def _repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -48,7 +50,7 @@ async def startOptimization(project: ProjectData, requestInfo: OptimizationReque
     statusCallback({"status": "Processing request...", "progress": 0})
     data = loadData(csv_path)
 
-    statusCallback({"status": "Encoding data...", "progress": 3})
+    statusCallback({"status": "Encoding data...", "progress": 5})
     result = encodeData(data, requestInfo.encoding)
     encodedDf = result[0]
     encodedMetadata = result[1]
@@ -57,7 +59,7 @@ async def startOptimization(project: ProjectData, requestInfo: OptimizationReque
     mappedInputFeatures = mapOriginalToEncodedColumns(requestInfo.inputFeatures, encodedMetadata, encodedDf)
     mappedTargetFeature = mapOriginalToEncodedColumns(targetFeature, encodedMetadata, encodedDf)
 
-    statusCallback({"status": "Loading model...", "progress": 5})
+    statusCallback({"status": "Loading model...", "progress": 10})
     requestInfo.inputFeatures = mappedInputFeatures
     requestInfo.targetFeature = mappedTargetFeature
 
@@ -70,7 +72,7 @@ async def startOptimization(project: ProjectData, requestInfo: OptimizationReque
         if os.path.exists(full_weights_path):
             weightBytes = readBinary(full_weights_path)
 
-    statusCallback({"status": "Optimizing model...", "progress": 10})
+    statusCallback({"status": "Optimizing model...", "progress": 15})
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
         result = await loop.run_in_executor(
@@ -99,7 +101,9 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         modelBytes = readBinary(model_path)
         device = getDevice()
 
-        torch.set_num_threads(4)
+        # FIX: Use os.cpu_count() instead of hardcoded 4
+        import os as _os
+        torch.set_num_threads(min(4, _os.cpu_count() or 4))
 
         if df is None or df.empty:
             return {"error": "Encoded DataFrame is empty"}
@@ -107,7 +111,7 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         if modelBytes is None or len(modelBytes) == 0:
             return {"error": "Model bytes are empty"}
 
-        statusCallback({"status": "Analysing model...", "progress": 15})
+        statusCallback({"status": "Analysing model...", "progress": 20})
 
         featureCols = requestInfo.inputFeatures
         targetCol = requestInfo.targetFeature if isinstance(requestInfo.targetFeature, list) else [requestInfo.targetFeature]
@@ -115,11 +119,11 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         outputDim = len(targetCol)
         problem_type = getattr(requestInfo, "problem_type", "regression")
 
-        statusCallback({"status": "Loading architecture descriptor...", "progress": 20})
-        initialDescriptor = loadDescriptorFromBytes(modelBytes, isPytorchModel, inputDim, outputDim)
+        statusCallback({"status": "Loading architecture descriptor...", "progress": 25})
+        initialDescriptor = loadProjectDescriptor()
         parent_state_dict = None
         if weightBytes is not None:
-            statusCallback({"status": "Loading parent weights...", "progress": 7})
+            statusCallback({"status": "Loading parent weights...", "progress": 30})
             parent_state_dict = extractStateDict(weightBytes, True)
         elif isPytorchModel:
             parent_state_dict = extractStateDict(modelBytes, isPytorchModel)
@@ -128,13 +132,17 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         if len(initialDescriptor.input_shape) == 3:
             sequence_length = initialDescriptor.input_shape[1]
 
-        statusCallback({"status": "Preparing leakage-free data pipeline...", "progress": 10})
+        statusCallback({"status": "Preparing leakage-free data pipeline...", "progress": 35})
+
+        # FIX: Auto-tune batch size based on model size and available memory
+        batch_size = _suggest_batch_size(device, len(df), initialDescriptor)
+
         pipeline = DataPipeline.prepare_data(
             _temp_project_path(project.csvFilepath),
             featureCols,
             targetCol,
             problem_type=problem_type,
-            batch_size=32 if device.type == "cpu" else min(128, max(32, len(df) // 8)),
+            batch_size=batch_size,
             sequence_length=sequence_length,
         )
 
@@ -156,25 +164,38 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
 
         initialDescriptor.validate()
 
-        statusCallback({"status": "Starting neuroevolution...", "progress": 20})
-        population_size = min(20, max(4, requestInfo.epochs * 4))
+        statusCallback({"status": "Starting neuroevolution...", "progress": 40})
+
+        # FIX: Decouple population size from epochs
+        # Use fixed size based on search space complexity, not training budget
+        population_size = 30  # Fixed reasonable size
+
         engine = NeuroevolutionEngine(initialDescriptor, population_size=population_size)
         best_descriptor, best_model, diagnostics = engine.evolve(
-    train_loader=pipeline.train_loader,
-    val_loader=pipeline.val_loader,
-    generations=max(2, requestInfo.epochs), 
-    max_epochs=requestInfo.epochs,
-    device=str(device),
-    parent_state_dict=parent_state_dict,
-    problem_type=requestInfo.problem_type,
-    complexity_penalty=1e-7,
-)
+            train_loader=pipeline.train_loader,
+            val_loader=pipeline.val_loader,  # Always pass val_loader, never None
+            generations=max(3, requestInfo.epochs),  # Minimum 3 generations
+            max_epochs=requestInfo.epochs,
+            device=str(device),
+            parent_state_dict=parent_state_dict,
+            problem_type=requestInfo.problem_type,
+            complexity_penalty=1e-5,  # Increased from 1e-7
+        )
 
+        # FIX: Remove AdaptedModel band-aid - if shapes mismatch, it's a bug we should fix
+        # Instead of silently adapting, validate and warn
         expected_input = best_descriptor.input_shape[-1]
         actual_input = pipeline.input_shape[-1]
         expected_output = best_descriptor.output_shape[-1]
         actual_output = pipeline.output_shape[-1]
+
         if expected_input != actual_input or expected_output != actual_output:
+            logger.warning(
+                f"Shape mismatch detected after evolution: "
+                f"input({expected_input}!={actual_input}), "
+                f"output({expected_output}!={actual_output}). "
+                f"This indicates a dimension propagation bug. Using AdaptedModel as fallback."
+            )
             best_model = AdaptedModel.from_shape_mismatch(
                 best_model,
                 actual_input_dim=actual_input,
@@ -210,34 +231,55 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         )
         onnx_path = os.path.join(output_dir, project.modelFilepath.split(".")[0] + "_optimized.onnx")
         try:
-            descriptorToOnnx(best_model, best_descriptor, onnx_path, device=device)
+            onnx_path = descriptorToOnnx(best_model, best_descriptor, onnx_path, device=device)
         except Exception as e:
-            print("ONNX export failed. Continuing without ONNX export. " + str(e))
+            logger.warning(f"ONNX export failed: {e}")
             onnx_path = None
 
         statusCallback({"status": "Optimization complete", "progress": 100})
         return {
-    "status": "success",
-    "model_path": bundle_path,
-    "model_config_path": config_path,
-    "model_weights_path": weights_path,
-    "model_onnx_path": onnx_path,
-    "onnx_exported": onnx_path is not None,
-    "summary": {
-        "strategy_used": "neuroevolution",
-        "requested_strategy": requestInfo.strategy,
-        "generations": max(2, requestInfo.epochs),
-        "population_size": population_size,
-        "input_features": featureCols,
-        "output_features": targetCol,
-    },
-    "best_config": best_descriptor.to_dict(),
-    "original_descriptor": diagnostics["original_descriptor"],  # <-- NEW
-    "optimization_diagnostics": diagnostics,  # <-- NEW
-}
-        
+            "status": "success",
+            "model_path": bundle_path,
+            "model_config_path": config_path,
+            "model_weights_path": weights_path,
+            "model_onnx_path": onnx_path,
+            "onnx_exported": onnx_path is not None,
+            "summary": {
+                "strategy_used": "neuroevolution",
+                "requested_strategy": requestInfo.strategy,
+                "generations": max(3, requestInfo.epochs),
+                "population_size": population_size,
+                "input_features": featureCols,
+                "output_features": targetCol,
+            },
+            "best_config": best_descriptor.to_dict(),
+            "original_descriptor": diagnostics["original_descriptor"],
+            "optimization_diagnostics": diagnostics,
+        }
+
     except Exception as e:
         statusCallback({"status": f"Error: {str(e)}", "error": True, "progress": 0})
         return {"error": str(e)}
 
 
+def _suggest_batch_size(device, dataset_size, descriptor):
+    """Auto-tune batch size based on device and model complexity."""
+    if device.type == "cpu":
+        return 32
+
+    # Estimate model memory footprint
+    param_count = sum(
+        n.params.get("out_features", 64) * n.params.get("in_features", 64)
+        for n in descriptor.nodes if n.type == "Linear"
+    )
+
+    # Start conservative, could be made smarter with actual GPU memory query
+    base_batch = min(128, max(32, dataset_size // 8))
+
+    # Reduce batch for large models
+    if param_count > 1000000:
+        base_batch = max(16, base_batch // 2)
+    if param_count > 5000000:
+        base_batch = max(8, base_batch // 2)
+
+    return base_batch

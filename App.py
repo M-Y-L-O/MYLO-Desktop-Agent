@@ -18,6 +18,16 @@ import shutil
 from Processing.Optimization.Optimizing import startOptimization
 from Types.Types import *
 from Processing.Models.ModelProcessing import analyseModel
+from Processing.Models.ModelEditing import (
+    loadProjectDescriptor,
+    validateDescriptorPayload,
+    applyModelEdit,
+    saveModelDescriptor,
+    visualizeModel,
+    expandNodes,
+    collapseNodes,
+    getEditorCatalog,
+)
 from Processing.Data.DataProcessingForVisualisation import analyseCSV
 from Processing.Optimization.Optimizing import startOptimization
 from Utils.FileHandler import saveFile
@@ -175,6 +185,134 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
+
+
+# ---------------- MODEL EDITOR ----------------
+
+@app.post("/getModelDescriptor")
+async def getModelDescriptor():
+    try:
+        descriptor = loadProjectDescriptor()
+        return JSONResponse({"descriptor": descriptor.to_dict()})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 400)
+
+
+@app.post("/validateModelDescriptor")
+async def validateModelDescriptor(request: Request):
+    try:
+        body = await request.json()
+        descriptor_dict = body.get("descriptor")
+        if not descriptor_dict:
+            return JSONResponse({"error": "descriptor is required"}, 400)
+        return JSONResponse(validateDescriptorPayload(descriptor_dict))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/editModel")
+async def editModel(request: Request):
+    try:
+        body = await request.json()
+        operation = body.get("operation")
+        payload = body.get("payload", {})
+        if not operation:
+            return JSONResponse({"error": "operation is required"}, 400)
+
+        result = applyModelEdit(
+            descriptor_dict=body.get("descriptor"),
+            operation=operation,
+            payload=payload,
+            persist=bool(body.get("persist", False)),
+            view_mode=body.get("viewMode", "summary"),
+            expanded_nodes=body.get("expandedNodes", []),
+        )
+        status = 200 if result.get("success") or result.get("valid") else 400
+        return JSONResponse(result, status)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/saveModelDescriptor")
+async def saveModelDescriptorEndpoint(request: Request):
+    try:
+        body = await request.json()
+        descriptor_dict = body.get("descriptor")
+        if not descriptor_dict:
+            return JSONResponse({"error": "descriptor is required"}, 400)
+
+        result = saveModelDescriptor(
+            descriptor_dict=descriptor_dict,
+            view_mode=body.get("viewMode", "summary"),
+            expanded_nodes=body.get("expandedNodes", []),
+        )
+        status = 200 if result.get("success") or result.get("valid") else 400
+        return JSONResponse(result, status)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/visualizeModel")
+async def visualizeModelEndpoint(request: Request):
+    try:
+        body = await request.json()
+        result = visualizeModel(
+            descriptor_dict=body.get("descriptor"),
+            view_mode=body.get("viewMode", "summary"),
+            expanded_nodes=body.get("expandedNodes", []),
+        )
+        if "error" in result and not result.get("valid", True):
+            return JSONResponse(result, 400)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/expandModelNodes")
+async def expandModelNodes(request: Request):
+    """Expand individual descriptor nodes into ONNX op-level sub-graphs."""
+    try:
+        body = await request.json()
+        node_ids = body.get("nodeIds") or body.get("node_ids") or []
+        if not node_ids:
+            return JSONResponse({"error": "nodeIds is required"}, 400)
+
+        result = expandNodes(
+            descriptor_dict=body.get("descriptor"),
+            node_ids=node_ids,
+            current_expanded=body.get("expandedNodes", []),
+        )
+        if "error" in result:
+            return JSONResponse(result, 400)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/collapseModelNodes")
+async def collapseModelNodes(request: Request):
+    """Collapse expanded ONNX sub-graphs back to high-level descriptor nodes."""
+    try:
+        body = await request.json()
+        node_ids = body.get("nodeIds") or body.get("node_ids") or []
+        if not node_ids:
+            return JSONResponse({"error": "nodeIds is required"}, 400)
+
+        result = collapseNodes(
+            descriptor_dict=body.get("descriptor"),
+            node_ids=node_ids,
+            current_expanded=body.get("expandedNodes", []),
+        )
+        if "error" in result:
+            return JSONResponse(result, 400)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/getModelEditorCatalog")
+async def getModelEditorCatalog():
+    return JSONResponse(getEditorCatalog())
 
 
 # ---------------- CSV ----------------

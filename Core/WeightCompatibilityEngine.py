@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, Any
 
+
 class WeightCompatibilityEngine:
     @staticmethod
     def transfer_weights(source_state_dict: Dict[str, torch.Tensor], target_module: nn.Module) -> Dict[str, Any]:
@@ -19,10 +20,10 @@ class WeightCompatibilityEngine:
         for src_key, src_tensor in source_state_dict.items():
             # Map legacy keys.
             target_key = WeightCompatibilityEngine._resolve_key_mapping(src_key, target_state_dict)
-            
+
             if target_key in target_state_dict:
                 tgt_tensor = target_state_dict[target_key]
-                
+
                 # Check shape compatibility
                 if src_tensor.shape == tgt_tensor.shape:
                     new_state_dict[target_key] = src_tensor
@@ -61,29 +62,52 @@ class WeightCompatibilityEngine:
         Heuristic key resolver to handle naming differences between 
         old fragile architectures and new named Node architectures.
         """
-        # Node modules use 'node_modules.<node_id>.<param>'
+        # Direct match
+        if src_key in target_state_dict:
+            return src_key
+
         # Try finding suffix matches
         suffix = src_key.split('.')[-1]
         for tk in target_state_dict.keys():
-            if tk.endswith(suffix) and tk.split('.')[-2] in src_key:
-                return tk
-                
-        # Direct match check
+            if tk.endswith(suffix):
+                # Check if the node ID is in the source key
+                tk_parts = tk.split('.')
+                if len(tk_parts) >= 2:
+                    node_id = tk_parts[-2]
+                    if node_id in src_key:
+                        return tk
+
+        # Direct match
         if f"node_modules.{src_key}" in target_state_dict:
             return f"node_modules.{src_key}"
-            
+
+        # Try matching by layer type and parameter name
+        # "lstm.weight_ih_l0" -> "node_modules.lstm.weight_ih_l0"
+        for tk in target_state_dict.keys():
+            if tk.endswith(suffix):
+                return tk
+
         return src_key
 
     @staticmethod
     def _partial_shape_transfer(src_tensor: torch.Tensor, tgt_tensor: torch.Tensor) -> torch.Tensor:
         """
         Transfers weights safely up to the minimum common dimensions.
-        Useful when an optimizer scale_width mutation happened.
         """
+        if len(src_tensor.shape) != len(tgt_tensor.shape):
+            return None
+
+        # Check shapes
+        for s, t in zip(src_tensor.shape, tgt_tensor.shape):
+            if s > t:
+                # Source is larger than target
+                return None
+
+        # Clone target
         tgt = tgt_tensor.clone()
-        if len(src_tensor.shape) == len(tgt_tensor.shape):
-            slices = tuple(slice(0, min(s, t)) for s, t in zip(src_tensor.shape, tgt_tensor.shape))
-            tgt[slices] = src_tensor[slices]
-            return tgt
-            
-        return None
+
+        
+        slices = tuple(slice(0, s) for s in src_tensor.shape)
+        tgt[slices] = src_tensor
+
+        return tgt

@@ -41,11 +41,13 @@ class OptimizationRequest:
     targetFeature = []
     epochs = 0
     generations = 5
+    problem_type = "regression" 
 
-    def __init__(self, encoding="", strategy="", inputFeatures=None, targetFeature=None, epochs=0, generations=5):
+    def __init__(self, encoding="", strategy="", inputFeatures=None, targetFeature=None, epochs=0, generations=5, problem_type="regression"):
         self.encoding = encoding
         self.strategy = strategy
         self.inputFeatures = inputFeatures if inputFeatures is not None else []
         self.targetFeature = targetFeature if targetFeature is not None else []
         self.epochs = epochs
         self.generations = generations
+        self.problem_type = problem_type 

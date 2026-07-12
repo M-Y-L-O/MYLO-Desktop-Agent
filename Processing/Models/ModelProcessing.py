@@ -1,7 +1,7 @@
 import os
 import torch
 
-from Processing.Models.DescriptorHandling import descriptorToGraph, loadDescriptorFromBytes
+from Processing.Models.DescriptorHandling import descriptorToGraph, loadDescriptorFromBytes, saveDescriptorToProject
 from Processing.Models.ONNXProcessing import analyseOnnx
 from Core.ArchitectureDescriptor import ArchitectureDescriptor
 
@@ -51,12 +51,14 @@ def analyseModel(filePath: str, originalFilename: str = "", weightsPath: str = "
         descriptor = _try_extract_descriptor(model_bytes, True)
         if not descriptor:
             return {"error": "Invalid .pt2 descriptor"}
+        saveDescriptorToProject(descriptor)
         return descriptorToGraph(descriptor)
 
     if weights_present:
         descriptor = _try_extract_descriptor(model_bytes, False)
         if not descriptor:
             return {"error": "Descriptor extraction failed for model + weights upload"}
+        saveDescriptorToProject(descriptor)
         return descriptorToGraph(descriptor)
 
     if filename.endswith((".pt", ".pth")):
@@ -68,6 +70,7 @@ def analyseModel(filePath: str, originalFilename: str = "", weightsPath: str = "
                     if key in loaded and isinstance(loaded[key], dict):
                         descriptor = ArchitectureDescriptor.from_dict(loaded[key])
                         descriptor.validate()
+                        saveDescriptorToProject(descriptor)
                         return descriptorToGraph(descriptor)
 
                 if "state_dict" in loaded or all(isinstance(v, torch.Tensor) for v in loaded.values()):
@@ -82,6 +85,7 @@ def analyseModel(filePath: str, originalFilename: str = "", weightsPath: str = "
 
         descriptor = _try_extract_descriptor(model_bytes, True)
         if descriptor:
+            saveDescriptorToProject(descriptor)
             return descriptorToGraph(descriptor)
 
         return _pytorch_visualization_response(
