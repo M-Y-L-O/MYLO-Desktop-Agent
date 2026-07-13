@@ -26,6 +26,11 @@ def _temp_project_path(filename: str) -> str:
     return os.path.join(_repo_root(), "temp_project", filename)
 
 
+def _optimized_filename(source_filename: str, extension: str) -> str:
+    stem, _ = os.path.splitext(os.path.basename(source_filename or "model"))
+    return f"{stem}_optimized{extension}"
+
+
 async def startOptimization(project: ProjectData, requestInfo: OptimizationRequest, statusCallback):
     statusCallback = statusCallback or (lambda *_args, **_kwargs: None)
     print(requestInfo)
@@ -113,13 +118,13 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         targetCol = requestInfo.targetFeature if isinstance(requestInfo.targetFeature, list) else [requestInfo.targetFeature]
         inputDim = len(featureCols)
         outputDim = len(targetCol)
-        problem_type = getattr(requestInfo, "problem_type", "regression")
+        problem_type = requestInfo.problemType if hasattr(requestInfo, "problemType") else "regression"
 
         statusCallback({"status": "Loading architecture descriptor...", "progress": 20})
         initialDescriptor = loadDescriptorFromBytes(modelBytes, isPytorchModel, inputDim, outputDim)
         parent_state_dict = None
         if weightBytes is not None:
-            statusCallback({"status": "Loading parent weights...", "progress": 7})
+            statusCallback({"status": "Loading parent weights...", "progress": 25})
             parent_state_dict = extractStateDict(weightBytes, True)
         elif isPytorchModel:
             parent_state_dict = extractStateDict(modelBytes, isPytorchModel)
@@ -128,7 +133,7 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         if len(initialDescriptor.input_shape) == 3:
             sequence_length = initialDescriptor.input_shape[1]
 
-        statusCallback({"status": "Preparing leakage-free data pipeline...", "progress": 10})
+        statusCallback({"status": "Preparing leakage-free data pipeline...", "progress": 30})
         pipeline = DataPipeline.prepare_data(
             _temp_project_path(project.csvFilepath),
             featureCols,
@@ -156,7 +161,7 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
 
         initialDescriptor.validate()
 
-        statusCallback({"status": "Starting neuroevolution...", "progress": 20})
+        statusCallback({"status": "Starting neuroevolution...", "progress": 40})
         population_size = min(20, max(4, requestInfo.epochs * 4))
         engine = NeuroevolutionEngine(initialDescriptor, population_size=population_size)
         best_descriptor, best_model, diagnostics = engine.evolve(
@@ -166,8 +171,9 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
     max_epochs=requestInfo.epochs,
     device=str(device),
     parent_state_dict=parent_state_dict,
-    problem_type=requestInfo.problem_type,
+    problem_type=requestInfo.problemType,
     complexity_penalty=1e-7,
+    statusCallback=statusCallback
 )
 
         expected_input = best_descriptor.input_shape[-1]
@@ -187,8 +193,8 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         output_dir = _temp_project_path("")
         config_path = os.path.join(output_dir, "model_config.json")
         weights_path = os.path.join(output_dir, "model_weights.pth")
-        bundle_path = os.path.join(output_dir, "optimized_model.pt2")
-        onnx_path = os.path.join(output_dir, "optimized_model.onnx")
+        bundle_path = os.path.join(output_dir, _optimized_filename(project.modelFilepath, ".pt2"))
+        onnx_path = os.path.join(output_dir, _optimized_filename(project.modelFilepath, ".onnx"))
 
         with open(config_path, "w", encoding="utf-8") as config_file:
             config_file.write(best_descriptor.to_json())
@@ -208,7 +214,6 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             },
             bundle_path,
         )
-        onnx_path = os.path.join(output_dir, project.modelFilepath.split(".")[0] + "_optimized.onnx")
         try:
             descriptorToOnnx(best_model, best_descriptor, onnx_path, device=device)
         except Exception as e:

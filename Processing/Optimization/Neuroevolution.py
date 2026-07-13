@@ -524,6 +524,7 @@ class NeuroevolutionEngine:
         criterion: Optional[nn.Module] = None,
         problem_type: str = "regression",
         complexity_penalty: float = 1e-7,
+        statusCallback: Optional[callable] = None,
     ) -> Tuple[ArchitectureDescriptor, nn.Module, Dict[str, Any]]:
         """
         Run tiered neuroevolution and return (best_descriptor, best_model, diagnostics).
@@ -536,6 +537,7 @@ class NeuroevolutionEngine:
         - total_mutations_attempted: sum across all gens
         - total_mutations_succeeded: sum across all gens
         """
+        statusCallback = statusCallback or self.statusCallback or (lambda *_args, **_kwargs: None)
         self.initialize_population(parent_state_dict)
 
         if criterion is None:
@@ -637,8 +639,10 @@ class NeuroevolutionEngine:
                         best_model = model
                         best_train_loss = train_loss
                         best_val_loss = val_loss
+                        statusCallback({"status": f"Gen {gen + 1} new best: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}, score={effective_score:.6f}", "progress": 40+(50/generations)*(gen+1)})
                         logger.info(f"Gen {gen + 1} new best: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}, score={effective_score:.6f}")
                 except Exception as e:
+                    statusCallback({"status": f"Gen {gen + 1} finals eval failed: {type(e).__name__}: {e}", "progress": 40+(50/generations)*(gen+1)})
                     logger.debug(f"Finals eval failed: {type(e).__name__}: {e}")
                     continue
 

@@ -53,6 +53,77 @@ app.add_middleware(
 def project_path(filename: str) -> str:
     return os.path.join("temp_project", filename)
 
+
+def slot_path(filename: str) -> str:
+    return project_path(filename)
+
+
+def slot_exists(filename: str) -> bool:
+    return bool(filename) and os.path.exists(slot_path(filename))
+
+
+def _slot_entry(key: str, section: str, label: str, filename: str, accept: str, can_upload: bool, can_optimize: bool, can_download: bool):
+    return {
+        "key": key,
+        "section": section,
+        "label": label,
+        "accept": accept,
+        "path": filename or "",
+        "name": filename or "",
+        "exists": slot_exists(filename),
+        "canUpload": can_upload,
+        "canVisualize": bool(filename),
+        "canOptimize": can_optimize,
+        "canDownload": can_download,
+    }
+
+
+def project_slots():
+    return [
+        _slot_entry("uploaded_pt2", "uploaded", "Uploaded PT2", CurrentProject.uploadedPt2Filepath, ".pt2", True, True, False),
+        _slot_entry("uploaded_onnx", "uploaded", "Uploaded ONNX", CurrentProject.uploadedOnnxFilepath, ".onnx", True, False, False),
+        _slot_entry("optimized_pt2", "optimized", "Optimized PT2", CurrentProject.optimizedPt2Filepath, ".pt2", False, False, True),
+        _slot_entry("optimized_onnx", "optimized", "Optimized ONNX", CurrentProject.optimizedOnnxFilepath, ".onnx", False, False, True),
+    ]
+
+
+def clear_slot(filename: str):
+    full_path = slot_path(filename)
+    if os.path.exists(full_path):
+        os.remove(full_path)
+
+
+def cleanup_existing_source_models(extension: str):
+    if not os.path.exists("temp_project"):
+        return
+
+    extension_groups = {
+        ".pt": {".pt", ".pth"},
+        ".pth": {".pt", ".pth"},
+        ".pt2": {".pt2"},
+        ".onnx": {".onnx"},
+    }
+
+    target_extensions = extension_groups.get(extension.lower(), {extension.lower()})
+
+    for filename in os.listdir("temp_project"):
+        full_path = project_path(filename)
+        if not os.path.isfile(full_path):
+            continue
+
+        lower_name = filename.lower()
+        _, existing_extension = os.path.splitext(lower_name)
+        if existing_extension in target_extensions and "optimized" not in lower_name:
+            os.remove(full_path)
+
+
+async def save_uploaded_to_slot(file: UploadFile, previous_filename: str = ""):
+    temp_path = await saveFile(file, path="temp_project")
+    target_filename = os.path.basename(file.filename or "")
+    if previous_filename and previous_filename != target_filename:
+        clear_slot(previous_filename)
+    return target_filename
+
 def loadProjectData():
     global CurrentProject
     if not CurrentProject.id and os.path.exists(project_path("projectInfo.json")):
@@ -62,6 +133,10 @@ def loadProjectData():
             CurrentProject.id = data.get("id", "")
             CurrentProject.csvFilepath = data.get("csvFilepath", "")
             CurrentProject.modelFilepath = data.get("modelFilepath", "")
+            CurrentProject.uploadedPt2Filepath = data.get("uploadedPt2Filepath", CurrentProject.modelFilepath or "")
+            CurrentProject.uploadedOnnxFilepath = data.get("uploadedOnnxFilepath", "")
+            CurrentProject.optimizedPt2Filepath = data.get("optimizedPt2Filepath", "")
+            CurrentProject.optimizedOnnxFilepath = data.get("optimizedOnnxFilepath", "")
             if "weightsFilepath" in data:
                 CurrentProject.weightsFilepath = data.get("weightsFilepath")
 
@@ -132,21 +207,16 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
     try:
         global CurrentProject
 
-        # cleanup
-        if CurrentProject.modelFilepath:
-            path = project_path(CurrentProject.modelFilepath)
-            if os.path.exists(path):
-                os.remove(path)
-
-        if getattr(CurrentProject, "weightsFilepath", None):
-            path = project_path(CurrentProject.weightsFilepath)
-            if os.path.exists(path):
-                os.remove(path)
-
-        # save
-        model_path = await saveFile(file, path="temp_project")
-        model_name = os.path.basename(model_path)
-        CurrentProject.modelFilepath = model_name
+        uploaded_extension = os.path.splitext(file.filename or "")[1].lower()
+        if uploaded_extension == ".pt2":
+            model_name = await save_uploaded_to_slot(file, CurrentProject.uploadedPt2Filepath)
+            CurrentProject.uploadedPt2Filepath = model_name
+            CurrentProject.modelFilepath = model_name
+        elif uploaded_extension == ".onnx":
+            model_name = await save_uploaded_to_slot(file, CurrentProject.uploadedOnnxFilepath)
+            CurrentProject.uploadedOnnxFilepath = model_name
+        else:
+            return JSONResponse({"error": f"Unsupported model extension: {uploaded_extension}"}, 400)
 
         if weightsFile:
             weights_path = await saveFile(weightsFile, path="temp_project")
@@ -170,6 +240,59 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
 
         with open(project_path("modelInfo.json"), "w") as f:
             json.dump(result, f)
+
+        return JSONResponse(result)
+
+    except Exception as e:
+        print(f"Error in /loadModel: {e}")
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/download-optimized")
+async def downloadOptimized(request: Request):
+    data = await request.json()
+    slot = (data.get("slot") or "").lower()
+    file_name = os.path.basename(data.get("fileName") or "")
+
+    if file_name:
+        full_path = slot_path(file_name)
+        if not os.path.exists(full_path):
+            return JSONResponse({"error": f"Optimized file not found: {file_name}"}, 404)
+        return FileResponse(full_path, filename=file_name)
+
+    if slot == "pt2":
+        filename = CurrentProject.optimizedPt2Filepath
+    elif slot == "onnx":
+        filename = CurrentProject.optimizedOnnxFilepath
+    else:
+        return JSONResponse({"error": "slot must be 'pt2' or 'onnx'"}, 400)
+
+    if not filename:
+        return JSONResponse({"error": f"Optimized file not found for slot: {slot}"}, 404)
+
+    full_path = slot_path(filename)
+    if not os.path.exists(full_path):
+        return JSONResponse({"error": f"Optimized file not found: {filename}"}, 404)
+
+    return FileResponse(full_path, filename=filename)
+
+
+@app.post("/visualizeProjectFile")
+async def visualizeProjectFile(request: Request):
+    try:
+        data = await request.json()
+        file_name = os.path.basename(data.get("filePath") or data.get("fileName") or "")
+
+        if not file_name:
+            return JSONResponse({"error": "fileName is required"}, 400)
+
+        full_path = project_path(file_name)
+        if not os.path.exists(full_path):
+            return JSONResponse({"error": f"File not found: {file_name}"}, 404)
+
+        result = analyseModel(full_path, originalFilename=file_name)
+        if isinstance(result, dict) and "error" in result:
+            return JSONResponse(result, 400)
 
         return JSONResponse(result)
 
@@ -220,20 +343,39 @@ async def optimizeModel(request: Request):
 
     queue = []
     body = await request.json()
+    requestedModelFile = os.path.basename(body.get("modelFilepath", "") or "")
     inputFeatures = body.get("inputFeatures", [])
     targetFeature = body.get("targetFeature", [])
     epochs = body.get("epochs", 10)
     encoding = body.get("encoding", "none")
     strategy = body.get("strategy", "brute-force")
     generations = body.get("generations", 5)
+    problemType = body.get("problemType", "regression")
+
+    if requestedModelFile:
+        requested_model_path = project_path(requestedModelFile)
+        if not os.path.exists(requested_model_path):
+            optimizing = False
+            return JSONResponse({"error": f"Model file not found: {requestedModelFile}"}, 404)
+        CurrentProject.modelFilepath = requestedModelFile
+        CurrentProject.dumpInTemp()
 
     if CurrentProject.modelFilepath.endswith(".onnx"):
+        optimizing = False
         return JSONResponse({"error": "ONNX optimization disabled"}, 400)
 
     def callback(status):
         queue.append(status)
 
-    result = await startOptimization(CurrentProject, OptimizationRequest(encoding=encoding, strategy=strategy, inputFeatures=inputFeatures, targetFeature=targetFeature, epochs=epochs, generations=generations), callback)
+    result = await startOptimization(CurrentProject, OptimizationRequest(encoding=encoding, strategy=strategy, inputFeatures=inputFeatures, targetFeature=targetFeature, epochs=epochs, generations=generations, problemType=problemType), callback)
+    if isinstance(result, dict) and result.get("status") == "success":
+        optimized_pt2_path = result.get("model_path")
+        optimized_onnx_path = result.get("model_onnx_path")
+        if optimized_pt2_path and os.path.exists(optimized_pt2_path):
+            CurrentProject.optimizedPt2Filepath = os.path.basename(optimized_pt2_path)
+        if optimized_onnx_path and os.path.exists(optimized_onnx_path):
+            CurrentProject.optimizedOnnxFilepath = os.path.basename(optimized_onnx_path)
+        CurrentProject.dumpInTemp()
     optimizing = False
     return JSONResponse({"status_updates": queue, "result": result})
 
@@ -270,6 +412,11 @@ async def newProject(request: Request):
     data = await request.json()
     CurrentProject.name = data.get("name", "New Project")
     CurrentProject.id = data.get("id", "")
+    CurrentProject.modelFilepath = ""
+    CurrentProject.uploadedPt2Filepath = ""
+    CurrentProject.uploadedOnnxFilepath = ""
+    CurrentProject.optimizedPt2Filepath = ""
+    CurrentProject.optimizedOnnxFilepath = ""
 
     CurrentProject.dumpInTemp()
 
@@ -308,10 +455,33 @@ async def getProject():
             "name": CurrentProject.name,
             "csvFile": CurrentProject.csvFilepath or "",
             "modelFile": CurrentProject.modelFilepath or "",
+            "uploadedPt2File": CurrentProject.uploadedPt2Filepath or "",
+            "uploadedOnnxFile": CurrentProject.uploadedOnnxFilepath or "",
+            "optimizedPt2File": CurrentProject.optimizedPt2Filepath or "",
+            "optimizedOnnxFile": CurrentProject.optimizedOnnxFilepath or "",
             "id": CurrentProject.id
         },
+        "projectFiles": project_slots(),
         "modelData": modelData,
         "csvData": csvData
+    })
+
+
+@app.post("/projectFiles")
+async def getProjectFiles():
+    loadProjectData()
+    return JSONResponse({
+        "projectData": {
+            "name": CurrentProject.name,
+            "csvFile": CurrentProject.csvFilepath or "",
+            "modelFile": CurrentProject.modelFilepath or "",
+            "uploadedPt2File": CurrentProject.uploadedPt2Filepath or "",
+            "uploadedOnnxFile": CurrentProject.uploadedOnnxFilepath or "",
+            "optimizedPt2File": CurrentProject.optimizedPt2Filepath or "",
+            "optimizedOnnxFile": CurrentProject.optimizedOnnxFilepath or "",
+            "id": CurrentProject.id
+        },
+        "files": project_slots(),
     })
 
 
@@ -365,15 +535,27 @@ async def loadProject(file: UploadFile = File(...)):
                 CurrentProject.csvFilepath = data.get("csvFilepath", "")
                 CurrentProject.id = data.get("id", "")
                 CurrentProject.name = data.get("name", "")
+                CurrentProject.uploadedPt2Filepath = data.get("uploadedPt2Filepath", CurrentProject.modelFilepath or "")
+                CurrentProject.uploadedOnnxFilepath = data.get("uploadedOnnxFilepath", "")
+                CurrentProject.optimizedPt2Filepath = data.get("optimizedPt2Filepath", "")
+                CurrentProject.optimizedOnnxFilepath = data.get("optimizedOnnxFilepath", "")
                 if "weightsFilepath" in data:
                     CurrentProject.weightsFilepath = data.get("weightsFilepath")
 
-        # validation 
-        if CurrentProject.modelFilepath and not os.path.exists(project_path(CurrentProject.modelFilepath)):
-            return JSONResponse({"error": "Model file missing after load"}, 500)
-
         if CurrentProject.csvFilepath and not os.path.exists(project_path(CurrentProject.csvFilepath)):
             return JSONResponse({"error": "CSV file missing after load"}, 500)
+
+        for filepath in [
+            CurrentProject.uploadedPt2Filepath,
+            CurrentProject.uploadedOnnxFilepath,
+            CurrentProject.optimizedPt2Filepath,
+            CurrentProject.optimizedOnnxFilepath,
+        ]:
+            if filepath and not os.path.exists(project_path(filepath)):
+                return JSONResponse({"error": f"Model file missing after load: {filepath}"}, 500)
+
+        if not CurrentProject.modelFilepath:
+            CurrentProject.modelFilepath = CurrentProject.uploadedPt2Filepath or ""
 
         CurrentProject.dumpInTemp()
 
