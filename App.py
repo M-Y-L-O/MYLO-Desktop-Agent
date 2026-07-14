@@ -14,6 +14,7 @@ import uvicorn
 import json
 from zipfile import ZipFile, ZIP_DEFLATED
 import shutil
+import pandas as pd
 
 from Processing.Optimization.Optimizing import startOptimization
 from Types.Types import *
@@ -28,9 +29,18 @@ from Processing.Models.ModelEditing import (
     collapseNodes,
     getEditorCatalog,
 )
-from Processing.Data.DataProcessingForVisualisation import analyseCSV
+from Processing.Data.DataProcessingForVisualisation import (
+    analyseCSV,
+    calculateDescriptiveStatistics,
+    calculateCorrelationMatrix,
+    analyzeDistributions,
+    performDataQualityChecks,
+    generateChartData,
+    analyzeTargetVariable
+)
 from Processing.Optimization.Optimizing import startOptimization
 from Utils.FileHandler import saveFile
+from Utils.Other import make_json_serializable
 
 
 # ---------------- GLOBAL STATE ----------------
@@ -463,6 +473,112 @@ async def loadCsv(file: UploadFile = File(...)):
 
         return JSONResponse(result)
 
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/advancedAnalysis")
+async def getAdvancedAnalysis():
+    try:
+        loadProjectData()
+        
+        if not CurrentProject.csvFilepath:
+            return JSONResponse({"error": "No CSV file loaded"}, 400)
+        
+        csv_path = project_path(CurrentProject.csvFilepath)
+        if not os.path.exists(csv_path):
+            return JSONResponse({"error": "CSV file not found"}, 404)
+        
+        df = pd.read_csv(csv_path)
+        
+        # Run all advanced analyses
+        descriptive_stats = calculateDescriptiveStatistics(df)
+        correlation_matrix = calculateCorrelationMatrix(df)
+        distributions = analyzeDistributions(df)
+        data_quality = performDataQualityChecks(df)
+        
+        result = {
+            "descriptive_statistics": descriptive_stats,
+            "correlation_analysis": correlation_matrix,
+            "distribution_analysis": distributions,
+            "data_quality_checks": data_quality
+        }
+        
+        result = make_json_serializable(result)
+        return JSONResponse(result)
+        
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/correlationAnalysis")
+async def getCorrelationAnalysis():
+    try:
+        loadProjectData()
+        
+        if not CurrentProject.csvFilepath:
+            return JSONResponse({"error": "No CSV file loaded"}, 400)
+        
+        csv_path = project_path(CurrentProject.csvFilepath)
+        if not os.path.exists(csv_path):
+            return JSONResponse({"error": "CSV file not found"}, 404)
+        
+        df = pd.read_csv(csv_path)
+        result = calculateCorrelationMatrix(df)
+        
+        result = make_json_serializable(result)
+        return JSONResponse(result)
+        
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/chartData")
+async def getChartData():
+    try:
+        loadProjectData()
+        
+        if not CurrentProject.csvFilepath:
+            return JSONResponse({"error": "No CSV file loaded"}, 400)
+        
+        csv_path = project_path(CurrentProject.csvFilepath)
+        if not os.path.exists(csv_path):
+            return JSONResponse({"error": "CSV file not found"}, 404)
+        
+        df = pd.read_csv(csv_path)
+        result = generateChartData(df)
+        
+        result = make_json_serializable(result)
+        return JSONResponse(result)
+        
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/targetAnalysis")
+async def getTargetAnalysis(request: Request):
+    try:
+        loadProjectData()
+        
+        if not CurrentProject.csvFilepath:
+            return JSONResponse({"error": "No CSV file loaded"}, 400)
+        
+        body = await request.json()
+        target_col = body.get("targetColumn")
+        
+        if not target_col:
+            return JSONResponse({"error": "targetColumn is required"}, 400)
+        
+        csv_path = project_path(CurrentProject.csvFilepath)
+        if not os.path.exists(csv_path):
+            return JSONResponse({"error": "CSV file not found"}, 404)
+        
+        df = pd.read_csv(csv_path)
+        result = analyzeTargetVariable(df, target_col)
+        
+        result = make_json_serializable(result)
+        return JSONResponse(result)
+        
     except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
 

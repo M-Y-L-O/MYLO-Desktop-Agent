@@ -1,4 +1,5 @@
 from Processing.Optimization.Neuroevolution import NeuroevolutionEngine
+from Processing.Optimization.OptunaSearch import OptunaSearchEngine
 from Types.Types import ProjectData, OptimizationRequest
 from Utils.FileHandler import loadData, readBinary
 from Utils.Other import getDevice
@@ -12,7 +13,14 @@ from Processing.Models.DescriptorHandling import loadDescriptorFromBytes, descri
 import os
 from Core.AdaptedModel import AdaptedModel
 import logging
+
 logger = logging.getLogger(__name__)
+
+NEUROEVOLUTION_POPULATION_SIZE = 30
+
+SUPPORTED_STRATEGIES = ("optuna", "neuroevolution") # Orice altceva se duce la default
+DEFAULT_STRATEGY = "neuroevolution"
+
 
 def _repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -28,9 +36,106 @@ def _temp_project_path(filename: str) -> str:
     return os.path.join(_repo_root(), "temp_project", filename)
 
 
-def _optimized_filename(source_filename: str, extension: str) -> str:
-    stem, _ = os.path.splitext(os.path.basename(source_filename or "model"))
-    return f"{stem}_optimized{extension}"
+def _suggest_batch_size(device, dataset_size, descriptor):
+    """Auto-tune batch size based on device and model complexity."""
+    if device.type == "cpu":
+        return 32
+
+    # Estimate model memory footprint
+    param_count = sum(
+        n.params.get("out_features", 64) * n.params.get("in_features", 64)
+        for n in descriptor.nodes if n.type == "Linear"
+    )
+
+    # Start conservative, could be made smarter with actual GPU memory query
+    base_batch = min(128, max(32, dataset_size // 8))
+
+    # Reduce batch for large models
+    if param_count > 1000000:
+        base_batch = max(16, base_batch // 2)
+    if param_count > 5000000:
+        base_batch = max(8, base_batch // 2)
+
+    return base_batch
+
+
+def _normalize_strategy(raw_strategy):
+    """Map the requested strategy to a supported engine, or fall back to default."""
+    if not raw_strategy:
+        return DEFAULT_STRATEGY
+    normalized = str(raw_strategy).strip().lower()
+    if normalized in SUPPORTED_STRATEGIES:
+        return normalized
+    logger.warning(
+        f"Unknown strategy '{raw_strategy}' requested; falling back to '{DEFAULT_STRATEGY}'."
+    )
+    return DEFAULT_STRATEGY
+
+
+def _build_engine(strategy, initial_descriptor, requestInfo, statusCallback):
+    
+    if strategy == "optuna":
+        statusCallback({"status": "Using Optuna architecture search...", "progress": 42})
+        engine = OptunaSearchEngine(
+            initial_descriptor=initial_descriptor,
+            n_trials=max(20, requestInfo.epochs * 2),
+            epochs_per_trial=min(10, requestInfo.epochs),
+            min_resource=2,
+            reduction_factor=3,
+            sampler_type="tpe",
+            pruner_type="hyperband",
+            n_startup_trials=8,
+            seed=42,
+            statusCallback=statusCallback,
+        )
+
+        def run(train_loader, val_loader, device, parent_state_dict, problem_type):
+            return engine.search(
+                train_loader=train_loader,
+                val_loader=val_loader,
+                max_epochs=requestInfo.epochs,
+                device=str(device),
+                parent_state_dict=parent_state_dict,
+                problem_type=problem_type,
+                complexity_penalty=1e-5,
+            )
+
+        def summary_builder(diagnostics):
+            return {
+                "sampler": diagnostics.get("sampler", "TPESampler"),
+                "pruner": diagnostics.get("pruner", "HyperbandPruner"),
+                "n_trials_requested": diagnostics.get("n_trials_requested"),
+                "n_trials_completed": diagnostics.get("n_trials_completed"),
+                "n_trials_pruned": diagnostics.get("n_trials_pruned"),
+                "prune_rate": diagnostics.get("prune_rate"),
+                "elapsed_seconds": diagnostics.get("elapsed_seconds"),
+            }
+
+        return "optuna", run, summary_builder
+
+    # Default: neuroevolution
+    statusCallback({"status": "Using neuroevolution optimization...", "progress": 42})
+    engine = NeuroevolutionEngine(initial_descriptor, population_size=NEUROEVOLUTION_POPULATION_SIZE)
+
+    def run(train_loader, val_loader, device, parent_state_dict, problem_type):
+        return engine.evolve(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            generations=max(3, requestInfo.epochs),
+            max_epochs=requestInfo.epochs,
+            device=str(device),
+            parent_state_dict=parent_state_dict,
+            problem_type=problem_type,
+            complexity_penalty=1e-5,
+        )
+
+    def summary_builder(_diagnostics):
+        return {
+            "generations": max(3, requestInfo.epochs),
+            "population_size": NEUROEVOLUTION_POPULATION_SIZE,
+        }
+
+    return "neuroevolution", run, summary_builder
 
 
 async def startOptimization(project: ProjectData, requestInfo: OptimizationRequest, statusCallback):
@@ -106,9 +211,8 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         modelBytes = readBinary(model_path)
         device = getDevice()
 
-        # FIX: Use os.cpu_count() instead of hardcoded 4
-        import os as _os
-        torch.set_num_threads(min(4, _os.cpu_count() or 4))
+        # Cap CPU threads so we don't fight the executor pool
+        torch.set_num_threads(min(4, os.cpu_count() or 4))
 
         if df is None or df.empty:
             return {"error": "Encoded DataFrame is empty"}
@@ -122,13 +226,13 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         targetCol = requestInfo.targetFeature if isinstance(requestInfo.targetFeature, list) else [requestInfo.targetFeature]
         inputDim = len(featureCols)
         outputDim = len(targetCol)
-        problem_type = requestInfo.problemType if hasattr(requestInfo, "problemType") else "regression"
+        problem_type = getattr(requestInfo, "problem_type", "regression")
 
         statusCallback({"status": "Loading architecture descriptor...", "progress": 25})
         initialDescriptor = loadProjectDescriptor()
         parent_state_dict = None
         if weightBytes is not None:
-            statusCallback({"status": "Loading parent weights...", "progress": 25})
+            statusCallback({"status": "Loading parent weights...", "progress": 30})
             parent_state_dict = extractStateDict(weightBytes, True)
         elif isPytorchModel:
             parent_state_dict = extractStateDict(modelBytes, isPytorchModel)
@@ -137,7 +241,11 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         if len(initialDescriptor.input_shape) == 3:
             sequence_length = initialDescriptor.input_shape[1]
 
-        statusCallback({"status": "Preparing leakage-free data pipeline...", "progress": 30})
+        statusCallback({"status": "Preparing leakage-free data pipeline...", "progress": 35})
+
+        # Auto-tune batch size based on model size and available memory
+        batch_size = _suggest_batch_size(device, len(df), initialDescriptor)
+
         pipeline = DataPipeline.prepare_data(
             _temp_project_path(project.csvFilepath),
             featureCols,
@@ -165,27 +273,25 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
 
         initialDescriptor.validate()
 
-        statusCallback({"status": "Starting neuroevolution...", "progress": 40})
+        statusCallback({"status": "Starting optimization...", "progress": 40})
 
-        # FIX: Decouple population size from epochs
-        # Use fixed size based on search space complexity, not training budget
-        population_size = 30  # Fixed reasonable size
-
-        engine = NeuroevolutionEngine(initialDescriptor, population_size=population_size)
-        best_descriptor, best_model, diagnostics = engine.evolve(
-            train_loader=pipeline.train_loader,
-            val_loader=pipeline.val_loader,  # Always pass val_loader, never None
-            generations=max(3, requestInfo.epochs),  # Minimum 3 generations
-            max_epochs=requestInfo.epochs,
-            device=str(device),
-            parent_state_dict=parent_state_dict,
-            problem_type=requestInfo.problem_type,
-            complexity_penalty=1e-5,  # Increased from 1e-7
+        # Strategy dispatch -- each branch is fully self-contained in _build_engine.
+        strategy, run_search, build_summary = _build_engine(
+            strategy=_normalize_strategy(getattr(requestInfo, "strategy", None)),
+            initial_descriptor=initialDescriptor,
+            requestInfo=requestInfo,
             statusCallback=statusCallback,
         )
 
-        # FIX: Remove AdaptedModel band-aid - if shapes mismatch, it's a bug we should fix
-        # Instead of silently adapting, validate and warn
+        best_descriptor, best_model, diagnostics = run_search(
+            train_loader=pipeline.train_loader,
+            val_loader=pipeline.val_loader,
+            device=device,
+            parent_state_dict=parent_state_dict,
+            problem_type=problem_type,
+        )
+
+        # Validate descriptor/model shape alignment; fall back to adapter on mismatch.
         expected_input = best_descriptor.input_shape[-1]
         actual_input = pipeline.input_shape[-1]
         expected_output = best_descriptor.output_shape[-1]
@@ -193,10 +299,10 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
 
         if expected_input != actual_input or expected_output != actual_output:
             logger.warning(
-                f"Shape mismatch detected after evolution: "
+                f"Shape mismatch detected after {strategy}: "
                 f"input({expected_input}!={actual_input}), "
                 f"output({expected_output}!={actual_output}). "
-                f"This indicates a dimension propagation bug. Using AdaptedModel as fallback."
+                f"Using AdaptedModel as fallback."
             )
             best_model = AdaptedModel.from_shape_mismatch(
                 best_model,
@@ -210,8 +316,8 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         output_dir = _temp_project_path("")
         config_path = os.path.join(output_dir, "model_config.json")
         weights_path = os.path.join(output_dir, "model_weights.pth")
-        bundle_path = os.path.join(output_dir, _optimized_filename(project.modelFilepath, ".pt2"))
-        onnx_path = os.path.join(output_dir, _optimized_filename(project.modelFilepath, ".onnx"))
+        bundle_path = os.path.join(output_dir, "optimized_model.pt2")
+        onnx_path = os.path.join(output_dir, "optimized_model.onnx")
 
         with open(config_path, "w", encoding="utf-8") as config_file:
             config_file.write(best_descriptor.to_json())
@@ -231,6 +337,7 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             },
             bundle_path,
         )
+        onnx_path = os.path.join(output_dir, project.modelFilepath.split(".")[0] + "_optimized.onnx")
         try:
             onnx_path = descriptorToOnnx(best_model, best_descriptor, onnx_path, device=device)
         except Exception as e:
@@ -238,6 +345,15 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             onnx_path = None
 
         statusCallback({"status": "Optimization complete", "progress": 100})
+
+        summary = {
+            "strategy_used": strategy,
+            "requested_strategy": getattr(requestInfo, "strategy", None),
+            "input_features": featureCols,
+            "output_features": targetCol,
+        }
+        summary.update(build_summary(diagnostics))
+
         return {
             "status": "success",
             "model_path": bundle_path,
@@ -245,42 +361,12 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             "model_weights_path": weights_path,
             "model_onnx_path": onnx_path,
             "onnx_exported": onnx_path is not None,
-            "summary": {
-                "strategy_used": "neuroevolution",
-                "requested_strategy": requestInfo.strategy,
-                "generations": max(3, requestInfo.epochs),
-                "population_size": population_size,
-                "input_features": featureCols,
-                "output_features": targetCol,
-            },
+            "summary": summary,
             "best_config": best_descriptor.to_dict(),
-            "original_descriptor": diagnostics["original_descriptor"],
+            "original_descriptor": diagnostics.get("original_descriptor") if isinstance(diagnostics, dict) else None,
             "optimization_diagnostics": diagnostics,
         }
 
     except Exception as e:
         statusCallback({"status": f"Error: {str(e)}", "error": True, "progress": 0})
         return {"error": str(e)}
-
-
-def _suggest_batch_size(device, dataset_size, descriptor):
-    """Auto-tune batch size based on device and model complexity."""
-    if device.type == "cpu":
-        return 32
-
-    # Estimate model memory footprint
-    param_count = sum(
-        n.params.get("out_features", 64) * n.params.get("in_features", 64)
-        for n in descriptor.nodes if n.type == "Linear"
-    )
-
-    # Start conservative, could be made smarter with actual GPU memory query
-    base_batch = min(128, max(32, dataset_size // 8))
-
-    # Reduce batch for large models
-    if param_count > 1000000:
-        base_batch = max(16, base_batch // 2)
-    if param_count > 5000000:
-        base_batch = max(8, base_batch // 2)
-
-    return base_batch
