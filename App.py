@@ -11,9 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import uvicorn
 
-import json
-from zipfile import ZipFile, ZIP_DEFLATED
-import shutil
 import pandas as pd
 
 from Processing.Optimization.Optimizing import startOptimization
@@ -27,8 +24,12 @@ from Processing.Models.ModelEditing import (
     visualizeModel,
     expandNodes,
     collapseNodes,
-    getEditorCatalog,
+    checkEdgeCompatibility,
+    undoModelEdit,
+    redoModelEdit,
+    _ProjectHistory,
 )
+from Processing.Models.node_catalog import get_catalog, TEMPLATES
 from Processing.Data.DataProcessingForVisualisation import (
     analyseCSV,
     calculateDescriptiveStatistics,
@@ -144,6 +145,7 @@ async def save_uploaded_to_slot(file: UploadFile, previous_filename: str = ""):
         clear_slot(previous_filename)
     return target_filename
 
+
 def loadProjectData():
     global CurrentProject
     if not CurrentProject.id and os.path.exists(project_path("projectInfo.json")):
@@ -160,7 +162,10 @@ def loadProjectData():
             if "weightsFilepath" in data:
                 CurrentProject.weightsFilepath = data.get("weightsFilepath")
 
+
 loadProjectData()
+
+
 # ---------------- MIDDLEWARE ----------------
 
 @app.middleware("http")
@@ -343,24 +348,65 @@ async def validateModelDescriptor(request: Request):
         return JSONResponse({"error": str(e)}, 500)
 
 
+def _handle_edit_request(body: dict, persist: bool, dry_run: bool) -> JSONResponse:
+    """Shared handler for editModel and previewEdit endpoints."""
+    operation = body.get("operation")
+    payload = body.get("payload", {})
+    if not operation:
+        return JSONResponse({"error": "operation is required"}, 400)
+
+    result = applyModelEdit(
+        descriptor_dict=body.get("descriptor"),
+        operation=operation,
+        payload=payload,
+        persist=persist,
+        view_mode=body.get("viewMode", "summary"),
+        expanded_nodes=body.get("expandedNodes", []),
+        dry_run=dry_run,
+    )
+    status = 200 if result.get("success") or result.get("valid") else 400
+    return JSONResponse(result, status)
+
+
 @app.post("/editModel")
 async def editModel(request: Request):
     try:
         body = await request.json()
-        operation = body.get("operation")
-        payload = body.get("payload", {})
-        if not operation:
-            return JSONResponse({"error": "operation is required"}, 400)
+        return _handle_edit_request(body, persist=bool(body.get("persist", False)), dry_run=False)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
 
-        result = applyModelEdit(
-            descriptor_dict=body.get("descriptor"),
-            operation=operation,
-            payload=payload,
-            persist=bool(body.get("persist", False)),
-            view_mode=body.get("viewMode", "summary"),
-            expanded_nodes=body.get("expandedNodes", []),
+
+@app.post("/previewEdit")
+async def previewEdit(request: Request):
+    try:
+        body = await request.json()
+        return _handle_edit_request(body, persist=False, dry_run=True)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/checkEdge")
+async def checkEdge(request: Request):
+    try:
+        body = await request.json()
+        descriptor_dict = body.get("descriptor")
+        source = body.get("source") or body.get("from")
+        target = body.get("target") or body.get("to")
+        source_port = body.get("sourcePort", body.get("source_port", "output"))
+        target_port = body.get("targetPort", body.get("target_port", "input"))
+
+        if not descriptor_dict or not source or not target:
+            return JSONResponse({"error": "descriptor, source, and target are required"}, 400)
+
+        result = checkEdgeCompatibility(
+            descriptor_dict=descriptor_dict,
+            source=source,
+            target=target,
+            source_port=source_port,
+            target_port=target_port,
         )
-        status = 200 if result.get("success") or result.get("valid") else 400
+        status = 200 if result.get("compatible") else 400
         return JSONResponse(result, status)
     except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
@@ -443,9 +489,46 @@ async def collapseModelNodes(request: Request):
         return JSONResponse({"error": str(e)}, 500)
 
 
-@app.post("/getModelEditorCatalog")
-async def getModelEditorCatalog():
-    return JSONResponse(getEditorCatalog())
+@app.get("/editor/catalog")
+async def editor_catalog():
+    """Return the node catalog for the model editor UI."""
+    return JSONResponse(get_catalog())
+
+
+@app.get("/editor/templates")
+async def editor_templates():
+    """Return common model template layouts."""
+    return JSONResponse({"templates": TEMPLATES})
+
+
+@app.post("/editor/undo")
+async def editor_undo(request: Request):
+    """Revert the last persisted model edit."""
+    try:
+        body = await request.json()
+        result = undoModelEdit(
+            view_mode=body.get("viewMode", "summary"),
+            expanded_nodes=body.get("expandedNodes", []),
+        )
+        status = 200 if result.get("success") else 400
+        return JSONResponse(result, status)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/editor/redo")
+async def editor_redo(request: Request):
+    """Re-apply the last undone model edit."""
+    try:
+        body = await request.json()
+        result = redoModelEdit(
+            view_mode=body.get("viewMode", "summary"),
+            expanded_nodes=body.get("expandedNodes", []),
+        )
+        status = 200 if result.get("success") else 400
+        return JSONResponse(result, status)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
 
 
 # ---------------- CSV ----------------
@@ -481,32 +564,31 @@ async def loadCsv(file: UploadFile = File(...)):
 async def getAdvancedAnalysis():
     try:
         loadProjectData()
-        
+
         if not CurrentProject.csvFilepath:
             return JSONResponse({"error": "No CSV file loaded"}, 400)
-        
+
         csv_path = project_path(CurrentProject.csvFilepath)
         if not os.path.exists(csv_path):
             return JSONResponse({"error": "CSV file not found"}, 404)
-        
+
         df = pd.read_csv(csv_path)
-        
-        # Run all advanced analyses
+
         descriptive_stats = calculateDescriptiveStatistics(df)
         correlation_matrix = calculateCorrelationMatrix(df)
         distributions = analyzeDistributions(df)
         data_quality = performDataQualityChecks(df)
-        
+
         result = {
             "descriptive_statistics": descriptive_stats,
             "correlation_analysis": correlation_matrix,
             "distribution_analysis": distributions,
             "data_quality_checks": data_quality
         }
-        
+
         result = make_json_serializable(result)
         return JSONResponse(result)
-        
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
 
@@ -515,20 +597,20 @@ async def getAdvancedAnalysis():
 async def getCorrelationAnalysis():
     try:
         loadProjectData()
-        
+
         if not CurrentProject.csvFilepath:
             return JSONResponse({"error": "No CSV file loaded"}, 400)
-        
+
         csv_path = project_path(CurrentProject.csvFilepath)
         if not os.path.exists(csv_path):
             return JSONResponse({"error": "CSV file not found"}, 404)
-        
+
         df = pd.read_csv(csv_path)
         result = calculateCorrelationMatrix(df)
-        
+
         result = make_json_serializable(result)
         return JSONResponse(result)
-        
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
 
@@ -537,20 +619,20 @@ async def getCorrelationAnalysis():
 async def getChartData():
     try:
         loadProjectData()
-        
+
         if not CurrentProject.csvFilepath:
             return JSONResponse({"error": "No CSV file loaded"}, 400)
-        
+
         csv_path = project_path(CurrentProject.csvFilepath)
         if not os.path.exists(csv_path):
             return JSONResponse({"error": "CSV file not found"}, 404)
-        
+
         df = pd.read_csv(csv_path)
         result = generateChartData(df)
-        
+
         result = make_json_serializable(result)
         return JSONResponse(result)
-        
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
 
@@ -559,26 +641,26 @@ async def getChartData():
 async def getTargetAnalysis(request: Request):
     try:
         loadProjectData()
-        
+
         if not CurrentProject.csvFilepath:
             return JSONResponse({"error": "No CSV file loaded"}, 400)
-        
+
         body = await request.json()
         target_col = body.get("targetColumn")
-        
+
         if not target_col:
             return JSONResponse({"error": "targetColumn is required"}, 400)
-        
+
         csv_path = project_path(CurrentProject.csvFilepath)
         if not os.path.exists(csv_path):
             return JSONResponse({"error": "CSV file not found"}, 404)
-        
+
         df = pd.read_csv(csv_path)
         result = analyzeTargetVariable(df, target_col)
-        
+
         result = make_json_serializable(result)
         return JSONResponse(result)
-        
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
 
@@ -621,7 +703,19 @@ async def optimizeModel(request: Request):
     def callback(status):
         queue.append(status)
 
-    result = await startOptimization(CurrentProject, OptimizationRequest(encoding=encoding, strategy=strategy, inputFeatures=inputFeatures, targetFeature=targetFeature, epochs=epochs, generations=generations, problemType=problemType), callback)
+    result = await startOptimization(
+        CurrentProject,
+        OptimizationRequest(
+            encoding=encoding,
+            strategy=strategy,
+            inputFeatures=inputFeatures,
+            targetFeature=targetFeature,
+            epochs=epochs,
+            generations=generations,
+            problemType=problemType
+        ),
+        callback
+    )
     if isinstance(result, dict) and result.get("status") == "success":
         optimized_pt2_path = result.get("model_path")
         optimized_onnx_path = result.get("model_onnx_path")
@@ -633,12 +727,13 @@ async def optimizeModel(request: Request):
     optimizing = False
     return JSONResponse({"status_updates": queue, "result": result})
 
+
 @app.get("/optimizationStatus")
 async def optimizationStatus(request: Request):
     global queue, optimizing
     if not optimizing:
         return JSONResponse({"status": "No optimization in progress"})
-    
+
     async def statusGenerator():
         while True:
             if await request.is_disconnected():
@@ -650,6 +745,7 @@ async def optimizationStatus(request: Request):
 
     return StreamingResponse(statusGenerator(), media_type="text/event-stream")
 
+
 # ---------------- PROJECT ----------------
 
 @app.post("/newProject")
@@ -659,6 +755,9 @@ async def newProject(request: Request):
 
     shutil.rmtree("temp_export", ignore_errors=True)
     os.makedirs("temp_export", exist_ok=True)
+
+    # Clear project-scoped history
+    _ProjectHistory.clear_project()
 
     global CurrentProject
     CurrentProject = ProjectData()
@@ -691,8 +790,6 @@ async def getProject():
 
     loadProjectData()
 
-    
-    
     modelData = {}
     csvData = {}
 
@@ -770,6 +867,9 @@ async def loadProject(file: UploadFile = File(...)):
 
         shutil.rmtree("temp_export", ignore_errors=True)
         os.makedirs("temp_export", exist_ok=True)
+
+        # Clear old project history when loading a new project
+        _ProjectHistory.clear_project()
 
         temp_path = await saveFile(file, path="temp_export")
 
