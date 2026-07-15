@@ -136,7 +136,7 @@ def saveProjectDescriptor(descriptor: ArchitectureDescriptor) -> None:
     descriptor_path = project_path(DESCRIPTOR_FILENAME)
     os.makedirs("temp_project", exist_ok=True)
 
-    # Validate before persisting
+    # Strict validation before persisting — no draft nodes allowed at save time
     descriptor.validate()
 
     # Save the new descriptor
@@ -240,6 +240,137 @@ def redoModelEdit(view_mode: str = "summary", expanded_nodes: Optional[List[str]
 
 
 # ---------------------------------------------------------------------------
+# Graph reachability / draft node utilities
+# ---------------------------------------------------------------------------
+
+def _get_input_node_ids(descriptor: ArchitectureDescriptor) -> Set[str]:
+    explicit_inputs = {
+        n.id for n in descriptor.nodes
+        if n.type.lower() == "input"
+    }
+    # Always include the virtual 'input' — it's the canonical graph source
+    explicit_inputs.add("input")
+    return explicit_inputs
+
+
+def _get_reachable_nodes(descriptor: ArchitectureDescriptor) -> Set[str]:
+    """Return all node IDs reachable from any Input source via outgoing edges."""
+    # Build adjacency list from all edges
+    adj: Dict[str, List[str]] = {}
+    all_node_ids = {n.id for n in descriptor.nodes}
+
+    # Initialize adjacency for all known nodes + virtual input/output
+    for node_id in all_node_ids:
+        adj[node_id] = []
+    adj["input"] = []
+    adj["output"] = []
+
+    for edge in descriptor.edges:
+        if edge.source in adj:
+            adj[edge.source].append(edge.target)
+
+    # BFS/DFS from all input sources
+    sources = _get_input_node_ids(descriptor)
+    reachable: Set[str] = set()
+    stack = list(sources)
+
+    while stack:
+        node_id = stack.pop()
+        if node_id in reachable:
+            continue
+        reachable.add(node_id)
+        # Only follow edges from real nodes (not from virtual output)
+        for neighbor in adj.get(node_id, []):
+            if neighbor not in reachable:
+                stack.append(neighbor)
+
+    return reachable
+
+
+def _get_active_subgraph(descriptor: ArchitectureDescriptor) -> ArchitectureDescriptor:
+    reachable = _get_reachable_nodes(descriptor)
+    # Filter to only real nodes (exclude virtual input/output)
+    active_node_ids = reachable - {"input", "output"}
+
+    active = copy.deepcopy(descriptor)
+    active.nodes = [n for n in active.nodes if n.id in active_node_ids]
+    active.edges = [
+        e for e in active.edges 
+        if (e.source in active_node_ids or e.source == "input")
+        and (e.target in active_node_ids or e.target == "output")
+    ]
+    return active
+
+
+def _get_draft_node_ids(descriptor: ArchitectureDescriptor) -> Set[str]:
+    """Return the set of real node IDs that are NOT reachable from any Input source."""
+    all_ids = {n.id for n in descriptor.nodes}
+    reachable = _get_reachable_nodes(descriptor)
+    # Remove virtual nodes from consideration
+    reachable_real = reachable - {"input", "output"}
+    return all_ids - reachable_real
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers with draft-node awareness
+# ---------------------------------------------------------------------------
+
+def _validate_with_drafts(
+    descriptor: ArchitectureDescriptor,
+    strict: bool = False
+) -> None:
+    if strict:
+        # Legacy behavior: every node must be valid and connected
+        descriptor.validate()
+        return
+
+    # Lenient mode: only validate the active (reachable) subgraph
+    draft_ids = _get_draft_node_ids(descriptor)
+
+    if not draft_ids:
+        # No draft nodes — validate everything normally
+        descriptor.validate()
+        return
+
+    # Extract active subgraph and validate it
+    active = _get_active_subgraph(descriptor)
+
+    if active.nodes:
+        active.validate()
+
+
+def _propagate_shapes_with_drafts(
+    descriptor: ArchitectureDescriptor
+) -> Dict[str, Any]:
+    draft_ids = _get_draft_node_ids(descriptor)
+
+    if not draft_ids:
+        # No drafts — normal shape propagation
+        try:
+            return {k: v for k, v in descriptor._propagate_shapes(mutate=False).items()}
+        except Exception:
+            return {}
+
+    # Work on active subgraph for shape propagation
+    active = _get_active_subgraph(descriptor)
+
+    try:
+        active_shapes = active._propagate_shapes(mutate=False)
+    except Exception:
+        active_shapes = {}
+
+    # Merge: active nodes get real shapes, draft nodes get None
+    all_shapes: Dict[str, Any] = {}
+    for node in descriptor.nodes:
+        if node.id in draft_ids:
+            all_shapes[node.id] = None  # Draft — no shape yet
+        else:
+            all_shapes[node.id] = active_shapes.get(node.id)
+
+    return all_shapes
+
+
+# ---------------------------------------------------------------------------
 # Visualization helpers (defined in this module so they are importable)
 # ---------------------------------------------------------------------------
 
@@ -259,6 +390,15 @@ def refreshModelVisualization(
     if "error" in graph:
         return graph
 
+    draft_ids = _get_draft_node_ids(descriptor)
+    graph["draftNodes"] = sorted(draft_ids)
+    graph["activeNodes"] = sorted({n.id for n in descriptor.nodes} - draft_ids)
+
+    # Per-node draft flag for convenience
+    if "nodes" in graph:
+        for node_entry in graph["nodes"]:
+            node_entry["isDraft"] = node_entry.get("id") in draft_ids
+
     graph["descriptor"] = descriptor.to_dict()
     graph["viewMode"] = view_mode
     graph["expandedNodes"] = expanded_nodes
@@ -269,16 +409,22 @@ def refreshModelVisualization(
     return graph
 
 
-def validateDescriptorPayload(descriptor_dict: Dict[str, Any]) -> Dict[str, Any]:
+def validateDescriptorPayload(descriptor_dict: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:
+    """Validate a descriptor payload. 
+
+    By default uses lenient validation (allows draft nodes).
+    Pass strict=True for save-time enforcement.
+    """
     try:
         descriptor = ArchitectureDescriptor.from_dict(descriptor_dict)
         descriptor.normalize_inplace()
-        descriptor.validate()
-        shapes = descriptor._propagate_shapes(mutate=False)
+        _validate_with_drafts(descriptor, strict=strict)
+        shapes = _propagate_shapes_with_drafts(descriptor)
         return {
             "valid": True,
             "descriptor": descriptor.to_dict(),
-            "shapes": {k: v for k, v in shapes.items()},
+            "shapes": shapes,
+            "draftNodes": sorted(_get_draft_node_ids(descriptor)),
         }
     except Exception as exc:
         return {"valid": False, "error": str(exc)}
@@ -302,7 +448,17 @@ class EditError(Exception):
 # ---------------------------------------------------------------------------
 
 class ModelEditEngine:
-    """Deterministic descriptor edit operations for the visual model editor."""
+    """Deterministic descriptor edit operations for the visual model editor.
+
+    EDITING MODE (default):
+        - Disconnected/draft nodes are ALLOWED
+        - Only the connected subgraph from Input sources is validated
+        - Users can freely place, move, and configure nodes before wiring
+
+    STRICT MODE (save/persist):
+        - All nodes must be valid and connected
+        - Triggered by saveProjectDescriptor() or explicit strict validation
+    """
 
     INSERTABLE_TYPES = [
         "Input", "Output", "Linear", "ReLU", "Tanh", "Sigmoid", "Dropout", "Identity",
@@ -312,7 +468,7 @@ class ModelEditEngine:
     PROTECTED_TYPES = {"LSTM", "GRU", "MultiheadAttention"}
 
     @classmethod
-    def apply(cls, descriptor: ArchitectureDescriptor, operation: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def apply(cls, descriptor: ArchitectureDescriptor, operation: str, payload: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:
         working = copy.deepcopy(descriptor)
         handler = {
             "add_node": cls._add_node,
@@ -344,14 +500,21 @@ class ModelEditEngine:
                 return result
 
             working.normalize_inplace()
-            working.validate()
-            shapes = working._propagate_shapes(mutate=False)
+
+            # --- KEY CHANGE: use draft-aware validation ---
+            _validate_with_drafts(working, strict=strict)
+
+            shapes = _propagate_shapes_with_drafts(working)
+            draft_ids = _get_draft_node_ids(working)
+
             return {
                 "success": True,
                 "descriptor": working.to_dict(),
-                "shapes": {k: v for k, v in shapes.items()},
+                "shapes": shapes,
                 "message": result.get("message", f"Applied {operation}"),
                 "affected": result.get("affected", {}),
+                "draftNodes": sorted(draft_ids),
+                "activeNodes": sorted({n.id for n in working.nodes} - draft_ids),
             }
         except EditError as exc:
             return {
@@ -539,9 +702,9 @@ class ModelEditEngine:
             raise EditError("MISSING_ARGUMENT", "target is required", field="target")
 
         node_ids = {n.id for n in descriptor.nodes}
-        if source not in node_ids:
+        if source not in node_ids and source != "input":
             raise EditError("NODE_NOT_FOUND", f"Source node not found: {source}", field="source", details={"nodeId": source})
-        if target not in node_ids:
+        if target not in node_ids and target != "output":
             raise EditError("NODE_NOT_FOUND", f"Target node not found: {target}", field="target", details={"nodeId": target})
 
         if any(e.source == source and e.target == target for e in descriptor.edges):
@@ -680,7 +843,10 @@ def applyModelEdit(
     else:
         descriptor = loadProjectDescriptor()
 
-    edit_result = ModelEditEngine.apply(descriptor, operation, payload)
+    # Use strict validation only when actually persisting to disk
+    strict = persist
+
+    edit_result = ModelEditEngine.apply(descriptor, operation, payload, strict=strict)
     if not edit_result.get("success"):
         return edit_result
 
@@ -703,7 +869,8 @@ def saveModelDescriptor(
     view_mode: str = "summary",
     expanded_nodes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    validation = validateDescriptorPayload(descriptor_dict)
+    """Save a model descriptor. Uses STRICT validation — no draft nodes allowed."""
+    validation = validateDescriptorPayload(descriptor_dict, strict=True)
     if not validation.get("valid"):
         return validation
 
@@ -733,44 +900,46 @@ def checkEdgeCompatibility(
         src_node = node_map.get(source)
         tgt_node = node_map.get(target)
 
-        if src_node is None:
+        if src_node is None and source != "input":
             return {"compatible": False, "code": "NODE_NOT_FOUND", "field": "source",
                     "error": f"Source node not found: {source}"}
-        if tgt_node is None:
+        if tgt_node is None and target != "output":
             return {"compatible": False, "code": "NODE_NOT_FOUND", "field": "target",
                     "error": f"Target node not found: {target}"}
 
-        # Validate ports exist on the respective node types
-        src_ports = _ports_for(src_node.type)
-        tgt_ports = _ports_for(tgt_node.type)
+        # For virtual input/output, we can't check ports — skip port validation
+        if source != "input" and src_node is not None:
+            src_ports = _ports_for(src_node.type)
+            if not any(p["id"] == source_port for p in src_ports["outputs"]):
+                return {
+                    "compatible": False,
+                    "code": "PORT_NOT_FOUND",
+                    "field": "sourcePort",
+                    "error": f"Source port '{source_port}' does not exist on {src_node.type}",
+                    "availablePorts": [p["id"] for p in src_ports["outputs"]],
+                }
 
-        if not any(p["id"] == source_port for p in src_ports["outputs"]):
-            return {
-                "compatible": False,
-                "code": "PORT_NOT_FOUND",
-                "field": "sourcePort",
-                "error": f"Source port '{source_port}' does not exist on {src_node.type}",
-                "availablePorts": [p["id"] for p in src_ports["outputs"]],
-            }
-        if not any(p["id"] == target_port for p in tgt_ports["inputs"]):
-            return {
-                "compatible": False,
-                "code": "PORT_NOT_FOUND",
-                "field": "targetPort",
-                "error": f"Target port '{target_port}' does not exist on {tgt_node.type}",
-                "availablePorts": [p["id"] for p in tgt_ports["inputs"]],
-            }
+        if target != "output" and tgt_node is not None:
+            tgt_ports = _ports_for(tgt_node.type)
+            if not any(p["id"] == target_port for p in tgt_ports["inputs"]):
+                return {
+                    "compatible": False,
+                    "code": "PORT_NOT_FOUND",
+                    "field": "targetPort",
+                    "error": f"Target port '{target_port}' does not exist on {tgt_node.type}",
+                    "availablePorts": [p["id"] for p in tgt_ports["inputs"]],
+                }
 
-        # Check compatibility hints
-        hint = COMPATIBILITY_HINTS.get(tgt_node.type)
-        if hint and src_node.type not in hint.get("accepts", []) and "*" not in hint.get("accepts", []):
-            return {
-                "compatible": False,
-                "code": "COMPATIBILITY_VIOLATION",
-                "field": None,
-                "error": f"{tgt_node.type} does not accept connections from {src_node.type}. {hint.get('note', '')}",
-                "hint": hint,
-            }
+            # Check compatibility hints only for real target nodes
+            hint = COMPATIBILITY_HINTS.get(tgt_node.type)
+            if hint and src_node is not None and src_node.type not in hint.get("accepts", []) and "*" not in hint.get("accepts", []):
+                return {
+                    "compatible": False,
+                    "code": "COMPATIBILITY_VIOLATION",
+                    "field": None,
+                    "error": f"{tgt_node.type} does not accept connections from {src_node.type}. {hint.get('note', '')}",
+                    "hint": hint,
+                }
 
         if any(e.source == source and e.target == target for e in descriptor.edges):
             return {"compatible": False, "code": "DUPLICATE_EDGE", "field": None,
@@ -778,9 +947,9 @@ def checkEdgeCompatibility(
 
         descriptor.edges.append(Edge(source=source, target=target, source_port=source_port, target_port=target_port))
         descriptor.normalize_inplace()
-        descriptor.validate()
+        _validate_with_drafts(descriptor, strict=False)
 
-        shapes = descriptor._propagate_shapes(mutate=False)
+        shapes = _propagate_shapes_with_drafts(descriptor)
         return {
             "compatible": True,
             "sourceShape": shapes.get(source),
@@ -803,7 +972,7 @@ def visualizeModel(
     expanded_nodes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     if descriptor_dict:
-        validation = validateDescriptorPayload(descriptor_dict)
+        validation = validateDescriptorPayload(descriptor_dict, strict=False)
         if not validation.get("valid"):
             return validation
         descriptor = ArchitectureDescriptor.from_dict(validation["descriptor"])
@@ -821,6 +990,14 @@ def visualizeModel(
     if "error" in graph:
         return graph
 
+    # --- DRAFT NODE METADATA ---
+    draft_ids = _get_draft_node_ids(descriptor)
+    graph["draftNodes"] = sorted(draft_ids)
+    graph["activeNodes"] = sorted({n.id for n in descriptor.nodes} - draft_ids)
+    if "nodes" in graph:
+        for node_entry in graph["nodes"]:
+            node_entry["isDraft"] = node_entry.get("id") in draft_ids
+
     graph["descriptor"] = descriptor.to_dict()
     graph["viewMode"] = view_mode
     graph["expandedNodes"] = expanded_nodes
@@ -832,10 +1009,10 @@ def expandNodes(
     node_ids: List[str],
     current_expanded: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Expand one or more descriptor nodes into ONNX sub-graphs while keeping others collapsed."""
+    """Expand one or more descriptor nodes into ONNX op-level sub-graphs while keeping others collapsed."""
     if descriptor_dict:
         descriptor = ArchitectureDescriptor.from_dict(descriptor_dict)
-        descriptor.validate()
+        _validate_with_drafts(descriptor, strict=False)
     else:
         descriptor = loadProjectDescriptor()
 

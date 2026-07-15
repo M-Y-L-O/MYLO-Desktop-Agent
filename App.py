@@ -28,6 +28,8 @@ from Processing.Models.ModelEditing import (
     undoModelEdit,
     redoModelEdit,
     _ProjectHistory,
+    _get_draft_node_ids,
+    _get_reachable_nodes,
 )
 from Processing.Models.node_catalog import get_catalog, TEMPLATES
 from Processing.Data.DataProcessingForVisualisation import (
@@ -58,7 +60,7 @@ load_dotenv()
 
 # ---------------- SETUP ----------------
 
-app = FastAPI(title="MYLO AGENT", version="0.2.1")
+app = FastAPI(title="MYLO AGENT", version="0.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -338,18 +340,28 @@ async def getModelDescriptor():
 
 @app.post("/validateModelDescriptor")
 async def validateModelDescriptor(request: Request):
+    """Validate a descriptor payload.
+
+    By default uses lenient validation (allows draft nodes).
+    Pass strict=true to enforce full validation (save/compile-time check).
+    """
     try:
         body = await request.json()
         descriptor_dict = body.get("descriptor")
+        strict = bool(body.get("strict", False))
         if not descriptor_dict:
             return JSONResponse({"error": "descriptor is required"}, 400)
-        return JSONResponse(validateDescriptorPayload(descriptor_dict))
+        return JSONResponse(validateDescriptorPayload(descriptor_dict, strict=strict))
     except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
 
 
 def _handle_edit_request(body: dict, persist: bool, dry_run: bool) -> JSONResponse:
-    """Shared handler for editModel and previewEdit endpoints."""
+    """Shared handler for editModel and previewEdit endpoints.
+
+    Editing (persist=False): lenient validation, draft nodes allowed.
+    Saving (persist=True): strict validation, all nodes must be valid.
+    """
     operation = body.get("operation")
     payload = body.get("payload", {})
     if not operation:
@@ -370,6 +382,11 @@ def _handle_edit_request(body: dict, persist: bool, dry_run: bool) -> JSONRespon
 
 @app.post("/editModel")
 async def editModel(request: Request):
+    """Apply an edit operation. Uses lenient validation by default.
+
+    Draft/disconnected nodes are allowed. Only the active connected subgraph
+    is validated. Set persist=true to enforce strict validation on save.
+    """
     try:
         body = await request.json()
         return _handle_edit_request(body, persist=bool(body.get("persist", False)), dry_run=False)
@@ -379,6 +396,7 @@ async def editModel(request: Request):
 
 @app.post("/previewEdit")
 async def previewEdit(request: Request):
+    """Preview an edit without persisting. Always uses lenient validation."""
     try:
         body = await request.json()
         return _handle_edit_request(body, persist=False, dry_run=True)
@@ -414,6 +432,7 @@ async def checkEdge(request: Request):
 
 @app.post("/saveModelDescriptor")
 async def saveModelDescriptorEndpoint(request: Request):
+    """Save a model descriptor. Uses STRICT validation — no draft nodes allowed."""
     try:
         body = await request.json()
         descriptor_dict = body.get("descriptor")
@@ -427,6 +446,56 @@ async def saveModelDescriptorEndpoint(request: Request):
         )
         status = 200 if result.get("success") or result.get("valid") else 400
         return JSONResponse(result, status)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/compileModelDescriptor")
+async def compileModelDescriptor(request: Request):
+    """Validate descriptor strictly for compilation/export."""
+    try:
+        body = await request.json()
+        descriptor_dict = body.get("descriptor")
+        if not descriptor_dict:
+            return JSONResponse({"error": "descriptor is required"}, 400)
+
+        from Core.ArchitectureDescriptor import ArchitectureDescriptor
+        descriptor = ArchitectureDescriptor.from_dict(descriptor_dict)
+        descriptor.normalize_inplace()
+
+        draft_ids = _get_draft_node_ids(descriptor)
+
+        if draft_ids:
+            return JSONResponse({
+                "valid": False,
+                "strict": True,
+                "code": "DRAFT_NODES_EXIST",
+                "message": f"Cannot compile: {len(draft_ids)} disconnected node(s) found",
+                "draftNodes": sorted(draft_ids),
+                "error": "All nodes must be connected to an Input before compiling. "
+                         "Connect draft nodes or remove them.",
+            }, 400)
+
+        # No draft nodes — do full strict validation
+        try:
+            descriptor.validate()
+            shapes = descriptor._propagate_shapes(mutate=False)
+            return JSONResponse({
+                "valid": True,
+                "strict": True,
+                "descriptor": descriptor.to_dict(),
+                "shapes": {k: v for k, v in shapes.items()},
+                "message": "Descriptor is valid for compilation",
+            })
+        except Exception as exc:
+            return JSONResponse({
+                "valid": False,
+                "strict": True,
+                "code": "VALIDATION_ERROR",
+                "message": str(exc),
+                "error": str(exc),
+            }, 400)
+
     except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
 
