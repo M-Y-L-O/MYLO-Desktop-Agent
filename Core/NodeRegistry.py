@@ -55,6 +55,8 @@ class NodeRegistry:
             return
             
         cls.register("Linear", nn.Linear, {"in_features": "in_features", "out_features": "out_features", "bias": "bias"})
+        cls.register("Input", nn.Identity, {})
+        cls.register("Output", nn.Identity, {})
         cls.register("Conv1d", nn.Conv1d, {"in_channels": "in_channels", "out_channels": "out_channels", "kernel_size": "kernel_size", "stride": "stride"})
         cls.register("Conv2d", nn.Conv2d, {"in_channels": "in_channels", "out_channels": "out_channels", "kernel_size": "kernel_size", "stride": "stride"})
         cls.register("LSTM", nn.LSTM, {"input_size": "input_size", "hidden_size": "hidden_size", "num_layers": "num_layers", "batch_first": "batch_first"}, execution_op="recurrent_lstm")

@@ -128,6 +128,8 @@ class ArchitectureDescriptor:
             raise ValueError("Descriptor has no path to output sink")
 
         for node in self.nodes:
+            if node.type == "Input":
+                continue
             if not incoming[node.id] and not any(edge.source == "input" and edge.target == node.id for edge in self.edges):
                 if node.id not in sources_to_output:
                     raise ValueError(f"Dangling node with no inputs: {node.id}")
@@ -397,7 +399,7 @@ class ArchitectureDescriptor:
             # forward() extracts the last timestep (out[:, -1, :]) so shape is [batch, hidden]
             batch = in_shape[0] if in_shape else -1
             return [batch, hidden]
-        if node.type in ("Identity", "Add", "Concat", "LayerNorm", "TransformerEncoderLayer"):
+        if node.type in ("Input", "Output", "Identity", "Add", "Concat", "LayerNorm", "TransformerEncoderLayer"):
             return list(in_shape)
         if node.type == "Reshape":
             target_shape = params.get("target_shape")
