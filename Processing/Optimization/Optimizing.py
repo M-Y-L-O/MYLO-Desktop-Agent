@@ -11,8 +11,10 @@ from Processing.Models.ModelEditing import loadProjectDescriptor
 from Processing.Data.DataPipeline import DataPipeline
 from Processing.Models.DescriptorHandling import loadDescriptorFromBytes, descriptorToOnnx, extractStateDict
 import os
-from Core.AdaptedModel import AdaptedModel
+import json
 import logging
+
+from Core.AdaptedModel import AdaptedModel
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +22,8 @@ NEUROEVOLUTION_POPULATION_SIZE = 30
 
 SUPPORTED_STRATEGIES = ("optuna", "neuroevolution") # Orice altceva se duce la default
 DEFAULT_STRATEGY = "neuroevolution"
+
+REPORT_FILENAME = "optimization_report.json"
 
 
 def _repo_root() -> str:
@@ -72,10 +76,69 @@ def _normalize_strategy(raw_strategy):
     return DEFAULT_STRATEGY
 
 
+def _request_generations(requestInfo) -> int:
+    raw = getattr(requestInfo, "generations", None)
+    try:
+        raw = int(raw)
+    except (TypeError, ValueError):
+        raw = None
+    if not raw or raw <= 0:
+        raw = getattr(requestInfo, "epochs", 5) or 5
+    return max(3, int(raw))
+
+
+def _request_problem_type(requestInfo) -> str:
+    return (
+        getattr(requestInfo, "problem_type", None)
+        or getattr(requestInfo, "problemType", None)
+        or "regression"
+    )
+
+
+def _diff_descriptors(original: dict, best: dict) -> dict:
+    original = original or {}
+    best = best or {}
+
+    orig_nodes = {n.get("id"): n for n in original.get("nodes", [])}
+    best_nodes = {n.get("id"): n for n in best.get("nodes", [])}
+
+    nodes_added = [n for nid, n in best_nodes.items() if nid not in orig_nodes]
+    nodes_removed = [n for nid, n in orig_nodes.items() if nid not in best_nodes]
+    nodes_changed = []
+    for nid in orig_nodes.keys() & best_nodes.keys():
+        o, b = orig_nodes[nid], best_nodes[nid]
+        if o.get("type") != b.get("type") or o.get("params") != b.get("params"):
+            nodes_changed.append({
+                "id": nid,
+                "before": {"type": o.get("type"), "params": o.get("params")},
+                "after": {"type": b.get("type"), "params": b.get("params")},
+            })
+
+    orig_edges = {(e.get("source"), e.get("target")) for e in original.get("edges", [])}
+    best_edges = {(e.get("source"), e.get("target")) for e in best.get("edges", [])}
+    edges_added = [{"source": s, "target": t} for (s, t) in sorted(best_edges - orig_edges, key=str)]
+    edges_removed = [{"source": s, "target": t} for (s, t) in sorted(orig_edges - best_edges, key=str)]
+
+    return {
+        "nodes_added": nodes_added,
+        "nodes_removed": nodes_removed,
+        "nodes_changed": nodes_changed,
+        "edges_added": edges_added,
+        "edges_removed": edges_removed,
+        "counts": {
+            "nodes_added": len(nodes_added),
+            "nodes_removed": len(nodes_removed),
+            "nodes_changed": len(nodes_changed),
+            "edges_added": len(edges_added),
+            "edges_removed": len(edges_removed),
+        },
+    }
+
+
 def _build_engine(strategy, initial_descriptor, requestInfo, statusCallback):
-    
+
     if strategy == "optuna":
-        statusCallback({"status": "Using Optuna architecture search...", "progress": 42})
+        statusCallback({"type": "phase", "phase": "optimizing", "status": "Using Optuna architecture search...", "progress": 42})
         engine = OptunaSearchEngine(
             initial_descriptor=initial_descriptor,
             n_trials=max(20, requestInfo.epochs * 2),
@@ -114,14 +177,21 @@ def _build_engine(strategy, initial_descriptor, requestInfo, statusCallback):
         return "optuna", run, summary_builder
 
     # Default: neuroevolution
-    statusCallback({"status": "Using neuroevolution optimization...", "progress": 42})
-    engine = NeuroevolutionEngine(initial_descriptor, population_size=NEUROEVOLUTION_POPULATION_SIZE)
+    statusCallback({"type": "phase", "phase": "optimizing", "status": "Using neuroevolution optimization...", "progress": 42})
+
+    
+    engine = NeuroevolutionEngine(
+        initial_descriptor,
+        population_size=NEUROEVOLUTION_POPULATION_SIZE,
+        statusCallback=statusCallback,
+    )
+    n_generations = _request_generations(requestInfo)
 
     def run(train_loader, val_loader, device, parent_state_dict, problem_type):
         return engine.evolve(
             train_loader=train_loader,
             val_loader=val_loader,
-            generations=max(3, requestInfo.epochs),
+            generations=n_generations,
             max_epochs=requestInfo.epochs,
             device=str(device),
             parent_state_dict=parent_state_dict,
@@ -129,10 +199,21 @@ def _build_engine(strategy, initial_descriptor, requestInfo, statusCallback):
             complexity_penalty=1e-5,
         )
 
-    def summary_builder(_diagnostics):
+    def summary_builder(diagnostics):
+        d = diagnostics if isinstance(diagnostics, dict) else {}
+        improvement = d.get("improvement") or {}
         return {
-            "generations": max(3, requestInfo.epochs),
+            "generations": n_generations,
             "population_size": NEUROEVOLUTION_POPULATION_SIZE,
+            "best_train_loss": d.get("best_train_loss"),
+            "best_val_loss": d.get("best_val_loss"),
+            "best_score": d.get("best_score"),
+            "val_loss_change_pct": improvement.get("val_loss_change_pct"),
+            "verdict": improvement.get("verdict"),
+            "total_mutation_successes": d.get("total_mutation_successes"),
+            "overall_mutation_success_rate": d.get("overall_mutation_success_rate"),
+            "stagnation_events": d.get("stagnation_events"),
+            "elapsed_seconds": d.get("elapsed_seconds"),
         }
 
     return "neuroevolution", run, summary_builder
@@ -157,10 +238,10 @@ async def startOptimization(project: ProjectData, requestInfo: OptimizationReque
     if not os.path.exists(model_path):
         return {"error": f"Model file not found: {model_path}"}
 
-    statusCallback({"status": "Processing request...", "progress": 0})
+    statusCallback({"type": "phase", "phase": "processing", "status": "Processing request...", "progress": 0})
     data = loadData(csv_path)
 
-    statusCallback({"status": "Encoding data...", "progress": 5})
+    statusCallback({"type": "phase", "phase": "encoding", "status": "Encoding data...", "progress": 5})
     result = encodeData(data, requestInfo.encoding)
     encodedDf = result[0]
     encodedMetadata = result[1]
@@ -169,7 +250,7 @@ async def startOptimization(project: ProjectData, requestInfo: OptimizationReque
     mappedInputFeatures = mapOriginalToEncodedColumns(requestInfo.inputFeatures, encodedMetadata, encodedDf)
     mappedTargetFeature = mapOriginalToEncodedColumns(targetFeature, encodedMetadata, encodedDf)
 
-    statusCallback({"status": "Loading model...", "progress": 10})
+    statusCallback({"type": "phase", "phase": "loading_model", "status": "Loading model...", "progress": 10})
     requestInfo.inputFeatures = mappedInputFeatures
     requestInfo.targetFeature = mappedTargetFeature
 
@@ -182,7 +263,7 @@ async def startOptimization(project: ProjectData, requestInfo: OptimizationReque
         if os.path.exists(full_weights_path):
             weightBytes = readBinary(full_weights_path)
 
-    statusCallback({"status": "Optimizing model...", "progress": 15})
+    statusCallback({"type": "phase", "phase": "optimizing", "status": "Optimizing model...", "progress": 15})
     loop = asyncio.get_event_loop()
     with concurrent.futures.ThreadPoolExecutor() as pool:
         result = await loop.run_in_executor(
@@ -220,19 +301,19 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         if modelBytes is None or len(modelBytes) == 0:
             return {"error": "Model bytes are empty"}
 
-        statusCallback({"status": "Analysing model...", "progress": 20})
+        statusCallback({"type": "phase", "phase": "analysing", "status": "Analysing model...", "progress": 20})
 
         featureCols = requestInfo.inputFeatures
         targetCol = requestInfo.targetFeature if isinstance(requestInfo.targetFeature, list) else [requestInfo.targetFeature]
         inputDim = len(featureCols)
         outputDim = len(targetCol)
-        problem_type = getattr(requestInfo, "problem_type", "regression")
+        problem_type = _request_problem_type(requestInfo)
 
-        statusCallback({"status": "Loading architecture descriptor...", "progress": 25})
+        statusCallback({"type": "phase", "phase": "loading_descriptor", "status": "Loading architecture descriptor...", "progress": 25})
         initialDescriptor = loadProjectDescriptor()
         parent_state_dict = None
         if weightBytes is not None:
-            statusCallback({"status": "Loading parent weights...", "progress": 30})
+            statusCallback({"type": "phase", "phase": "loading_weights", "status": "Loading parent weights...", "progress": 30})
             parent_state_dict = extractStateDict(weightBytes, True)
         elif isPytorchModel:
             parent_state_dict = extractStateDict(modelBytes, isPytorchModel)
@@ -241,7 +322,7 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         if len(initialDescriptor.input_shape) == 3:
             sequence_length = initialDescriptor.input_shape[1]
 
-        statusCallback({"status": "Preparing leakage-free data pipeline...", "progress": 35})
+        statusCallback({"type": "phase", "phase": "data_pipeline", "status": "Preparing leakage-free data pipeline...", "progress": 35})
 
         # Auto-tune batch size based on model size and available memory
         batch_size = _suggest_batch_size(device, len(df), initialDescriptor)
@@ -273,7 +354,10 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
 
         initialDescriptor.validate()
 
-        statusCallback({"status": "Starting optimization...", "progress": 40})
+        # Snapshot the true "before" architecture for the diff/report
+        original_descriptor_dict = initialDescriptor.to_dict()
+
+        statusCallback({"type": "phase", "phase": "optimizing", "status": "Starting optimization...", "progress": 40})
 
         # Strategy dispatch -- each branch is fully self-contained in _build_engine.
         strategy, run_search, build_summary = _build_engine(
@@ -312,7 +396,7 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
                 expected_output_dim=expected_output,
             )
 
-        statusCallback({"status": "Saving optimized model bundle...", "progress": 90})
+        statusCallback({"type": "phase", "phase": "saving", "status": "Saving optimized model bundle...", "progress": 90})
         output_dir = _temp_project_path("")
         config_path = os.path.join(output_dir, "model_config.json")
         weights_path = os.path.join(output_dir, "model_weights.pth")
@@ -344,7 +428,10 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             logger.warning(f"ONNX export failed: {e}")
             onnx_path = None
 
-        statusCallback({"status": "Optimization complete", "progress": 100})
+        if isinstance(diagnostics, dict) and diagnostics.get("original_descriptor"):
+            original_descriptor_dict = diagnostics["original_descriptor"]
+
+        architecture_diff = _diff_descriptors(original_descriptor_dict, best_descriptor.to_dict())
 
         summary = {
             "strategy_used": strategy,
@@ -354,7 +441,9 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         }
         summary.update(build_summary(diagnostics))
 
-        return {
+        diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+
+        result = {
             "status": "success",
             "model_path": bundle_path,
             "model_config_path": config_path,
@@ -363,10 +452,36 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             "onnx_exported": onnx_path is not None,
             "summary": summary,
             "best_config": best_descriptor.to_dict(),
-            "original_descriptor": diagnostics.get("original_descriptor") if isinstance(diagnostics, dict) else None,
+            "original_descriptor": original_descriptor_dict,
+            "architecture_diff": architecture_diff,
             "optimization_diagnostics": diagnostics,
+            "baseline": diagnostics.get("baseline"),
+            "champion": diagnostics.get("champion"),
+            "improvement": diagnostics.get("improvement"),
+            "champion_lineage": diagnostics.get("champion_lineage"),
+            "training_history": diagnostics.get("champion_training"),
+            "mutation_timeline": diagnostics.get("mutation_timeline"),
         }
 
+        report_path = os.path.join(output_dir, REPORT_FILENAME)
+        result["report_path"] = report_path
+        try:
+            with open(report_path, "w", encoding="utf-8") as report_file:
+                json.dump(result, report_file, indent=2, default=str)
+        except Exception as e:
+            logger.warning(f"Could not persist optimization report: {e}")
+            result["report_path"] = None
+
+        statusCallback({
+            "type": "phase",
+            "phase": "complete",
+            "status": "Optimization complete",
+            "progress": 100,
+            "improvement": result.get("improvement"),
+        })
+
+        return result
+
     except Exception as e:
-        statusCallback({"status": f"Error: {str(e)}", "error": True, "progress": 0})
+        statusCallback({"type": "error", "status": f"Error: {str(e)}", "error": True, "progress": 0})
         return {"error": str(e)}
