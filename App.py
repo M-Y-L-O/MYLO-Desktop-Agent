@@ -41,7 +41,6 @@ from Processing.Data.DataProcessingForVisualisation import (
     generateChartData,
     analyzeTargetVariable
 )
-from Processing.Optimization.Optimizing import startOptimization
 from Utils.FileHandler import saveFile
 from Utils.Other import make_json_serializable
 
@@ -54,6 +53,8 @@ queue = []
 optimizing = False
 
 MIDDLEWARE_EXCEPTIONS = ["/", "/initialize", "/docs", "/openapi.json", "/optimizationStatus"]
+
+REPORT_FILENAME = "optimization_report.json"
 
 load_dotenv()
 
@@ -163,6 +164,32 @@ def loadProjectData():
             CurrentProject.optimizedOnnxFilepath = data.get("optimizedOnnxFilepath", "")
             if "weightsFilepath" in data:
                 CurrentProject.weightsFilepath = data.get("weightsFilepath")
+
+
+def load_optimization_report():
+    report_file = project_path(REPORT_FILENAME)
+    if not os.path.exists(report_file):
+        return None
+    try:
+        with open(report_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def optimization_report_summary():
+    """Slim subset of the report safe to embed in /getProject responses."""
+    report = load_optimization_report()
+    if not report:
+        return None
+    return {
+        "summary": report.get("summary"),
+        "improvement": report.get("improvement"),
+        "baseline": report.get("baseline"),
+        "champion": report.get("champion"),
+        "architecture_diff_counts": (report.get("architecture_diff") or {}).get("counts"),
+        "onnx_exported": report.get("onnx_exported"),
+    }
 
 
 loadProjectData()
@@ -772,19 +799,27 @@ async def optimizeModel(request: Request):
     def callback(status):
         queue.append(status)
 
-    result = await startOptimization(
-        CurrentProject,
-        OptimizationRequest(
-            encoding=encoding,
-            strategy=strategy,
-            inputFeatures=inputFeatures,
-            targetFeature=targetFeature,
-            epochs=epochs,
-            generations=generations,
-            problemType=problemType
-        ),
-        callback
-    )
+    try:
+        result = await startOptimization(
+            CurrentProject,
+            OptimizationRequest(
+                encoding=encoding,
+                strategy=strategy,
+                inputFeatures=inputFeatures,
+                targetFeature=targetFeature,
+                epochs=epochs,
+                generations=generations,
+                problemType=problemType
+            ),
+            callback
+        )
+    except Exception as e:
+        result = {"error": str(e)}
+        queue.append({"type": "error", "status": f"Error: {e}", "error": True, "progress": 0})
+    finally:
+        # Always release the global lock, even if the optimizer blew up.
+        optimizing = False
+
     if isinstance(result, dict) and result.get("status") == "success":
         optimized_pt2_path = result.get("model_path")
         optimized_onnx_path = result.get("model_onnx_path")
@@ -793,7 +828,18 @@ async def optimizeModel(request: Request):
         if optimized_onnx_path and os.path.exists(optimized_onnx_path):
             CurrentProject.optimizedOnnxFilepath = os.path.basename(optimized_onnx_path)
         CurrentProject.dumpInTemp()
-    optimizing = False
+
+        # Final structured event for SSE listeners (carries the headline numbers)
+        queue.append({
+            "type": "complete",
+            "status": "Optimization complete",
+            "progress": 100,
+            "improvement": result.get("improvement"),
+            "summary": result.get("summary"),
+        })
+    elif isinstance(result, dict) and "error" in result:
+        queue.append({"type": "error", "status": f"Optimization failed: {result.get('error')}", "error": True, "progress": 0})
+
     return JSONResponse({"status_updates": queue, "result": result})
 
 
@@ -810,9 +856,23 @@ async def optimizationStatus(request: Request):
             if queue:
                 message = queue.pop(0)
                 yield f"data: {json.dumps(message)}\n\n"
+            elif not optimizing:
+                # Queue drained and the worker finished — tell the client and close.
+                yield f"data: {json.dumps({'type': 'done', 'status': 'Optimization finished', 'progress': 100})}\n\n"
+                break
             await asyncio.sleep(0.1)
 
     return StreamingResponse(statusGenerator(), media_type="text/event-stream")
+
+
+@app.get("/optimizationReport")
+async def optimizationReport():
+    """Return the full persisted optimization report (metrics, mutation
+    timeline, lineage, training curves, architecture diff)."""
+    report = load_optimization_report()
+    if report is None:
+        return JSONResponse({"error": "No optimization report available"}, 404)
+    return JSONResponse(report)
 
 
 # ---------------- PROJECT ----------------
@@ -870,6 +930,8 @@ async def getProject():
         with open(project_path("csvInfo.json")) as f:
             csvData = json.load(f)
 
+    report_summary = optimization_report_summary()
+
     return JSONResponse({
         "projectData": {
             "name": CurrentProject.name,
@@ -883,7 +945,9 @@ async def getProject():
         },
         "projectFiles": project_slots(),
         "modelData": modelData,
-        "csvData": csvData
+        "csvData": csvData,
+        "hasOptimizationReport": report_summary is not None,
+        "optimizationSummary": report_summary
     })
 
 
