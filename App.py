@@ -27,6 +27,7 @@ from Processing.Models.ModelEditing import (
     checkEdgeCompatibility,
     undoModelEdit,
     redoModelEdit,
+    exportUploadedPt2ToOnnx,
     _ProjectHistory,
     _get_draft_node_ids,
     _get_reachable_nodes,
@@ -104,8 +105,8 @@ def _slot_entry(key: str, section: str, label: str, filename: str, accept: str, 
 
 def project_slots():
     return [
-        _slot_entry("uploaded_pt2", "uploaded", "Uploaded PT2", CurrentProject.uploadedPt2Filepath, ".pt2", True, True, False),
-        _slot_entry("uploaded_onnx", "uploaded", "Uploaded ONNX", CurrentProject.uploadedOnnxFilepath, ".onnx", True, False, False),
+        _slot_entry("uploaded_pt2", "uploaded", "Uploaded PT2", CurrentProject.uploadedPt2Filepath, ".pt2", True, True, True),
+        _slot_entry("uploaded_onnx", "uploaded", "Uploaded ONNX", CurrentProject.uploadedOnnxFilepath, ".onnx", True, False, True),
         _slot_entry("optimized_pt2", "optimized", "Optimized PT2", CurrentProject.optimizedPt2Filepath, ".pt2", False, False, True),
         _slot_entry("optimized_onnx", "optimized", "Optimized ONNX", CurrentProject.optimizedOnnxFilepath, ".onnx", False, False, True),
     ]
@@ -299,6 +300,32 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
 
     except Exception as e:
         print(f"Error in /loadModel: {e}")
+        return JSONResponse({"error": str(e)}, 500)
+
+
+@app.post("/generateOnnxFromPt2")
+async def generateOnnxFromPt2():
+    """Convert the uploaded PT2 into the uploaded ONNX slot."""
+    try:
+        global CurrentProject
+        loadProjectData()
+        if not CurrentProject.uploadedPt2Filepath:
+            return JSONResponse({"error": "No uploaded PT2 model found"}, 400)
+
+        result = exportUploadedPt2ToOnnx(
+            CurrentProject.uploadedPt2Filepath,
+            CurrentProject.uploadedOnnxFilepath,
+        )
+        if "error" in result:
+            return JSONResponse(result, 400)
+
+        CurrentProject.uploadedOnnxFilepath = result["onnxFile"]
+        CurrentProject.dumpInTemp()
+        return JSONResponse({
+            **result,
+            "files": project_slots(),
+        })
+    except Exception as e:
         return JSONResponse({"error": str(e)}, 500)
 
 

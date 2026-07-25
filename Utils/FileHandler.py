@@ -1,5 +1,4 @@
 import os
-from tkinter import filedialog
 import pandas as pd
 
 from fastapi.params import File

@@ -37,7 +37,7 @@ class ArchitectureDescriptor:
     merge_rules: Dict[str, Any] = field(default_factory=dict)
     propagation_rules: str = "deterministic_forward"
 
-    def validate(self) -> bool:
+    def validate(self, strict: bool = True) -> bool:
         """Perform static validation of the descriptor graph and tensor contracts."""
         node_ids = {node.id for node in self.nodes}
         if len(node_ids) != len(self.nodes):
@@ -50,15 +50,15 @@ class ArchitectureDescriptor:
                 raise ValueError(f"Edge target not found: {edge.target}")
 
         self._validate_acyclic()
-        self._validate_reachability(node_ids)
-        self._validate_ports(node_ids)
-        self._validate_multi_input_nodes()
-        self._validate_shape_propagation()
+        self._validate_reachability(node_ids, strict=strict)
+        self._validate_ports(node_ids, strict=strict)
+        self._validate_multi_input_nodes(strict=strict)
+        self._validate_shape_propagation(strict=strict)
         return True
 
-    def normalize_inplace(self) -> "ArchitectureDescriptor":
+    def normalize_inplace(self, strict: bool = True) -> "ArchitectureDescriptor":
         """Apply deterministic shape propagation to node parameters in place."""
-        self._propagate_shapes(mutate=True)
+        self._propagate_shapes(mutate=True, strict=strict)
         return self
 
     def _validate_acyclic(self):
@@ -88,7 +88,7 @@ class ArchitectureDescriptor:
         if visited != len(indegree):
             raise ValueError("Descriptor graph contains cycles")
 
-    def _validate_reachability(self, node_ids: Set[str]):
+    def _validate_reachability(self, node_ids: Set[str], strict: bool = True):
         reachable = {"input"}
         queue = ["input"]
 
@@ -106,14 +106,15 @@ class ArchitectureDescriptor:
                     reachable.add(neighbor)
                     queue.append(neighbor)
 
-        if "output" not in reachable:
+        if strict and "output" not in reachable:
             raise ValueError("Descriptor has no path to output from input")
 
-        disconnected_nodes = [node_id for node_id in node_ids if node_id not in reachable]
-        if disconnected_nodes:
-            raise ValueError(f"Descriptor contains disconnected nodes: {disconnected_nodes}")
+        if strict:
+            disconnected_nodes = [node_id for node_id in node_ids if node_id not in reachable]
+            if disconnected_nodes:
+                raise ValueError(f"Descriptor contains disconnected nodes: {disconnected_nodes}")
 
-    def _validate_ports(self, node_ids: Set[str]):
+    def _validate_ports(self, node_ids: Set[str], strict: bool = True):
         incoming: Dict[str, List[str]] = {node_id: [] for node_id in node_ids}
         outgoing: Dict[str, List[str]] = {node_id: [] for node_id in node_ids}
 
@@ -124,17 +125,17 @@ class ArchitectureDescriptor:
                 incoming[edge.target].append(edge.source)
 
         sources_to_output = [edge.source for edge in self.edges if edge.target == "output"]
-        if not sources_to_output:
+        if strict and not sources_to_output:
             raise ValueError("Descriptor has no path to output sink")
 
         for node in self.nodes:
             if node.type == "Input":
                 continue
             if not incoming[node.id] and not any(edge.source == "input" and edge.target == node.id for edge in self.edges):
-                if node.id not in sources_to_output:
+                if strict and node.id not in sources_to_output:
                     raise ValueError(f"Dangling node with no inputs: {node.id}")
 
-    def _validate_multi_input_nodes(self):
+    def _validate_multi_input_nodes(self, strict: bool = True):
         incoming_counts: Dict[str, int] = {node.id: 0 for node in self.nodes}
         for edge in self.edges:
             if edge.target in incoming_counts:
@@ -143,24 +144,36 @@ class ArchitectureDescriptor:
         allowed_multi_input = {"Add", "Concat"}
         for node in self.nodes:
             if incoming_counts.get(node.id, 0) > 1 and node.type not in allowed_multi_input:
-                raise ValueError(
-                    f"Node {node.id} has multiple inputs but type {node.type} is not an explicit merge op"
-                )
+                if strict:
+                    raise ValueError(
+                        f"Node {node.id} has multiple inputs but type {node.type} is not an explicit merge op"
+                    )
 
-    def _validate_shape_propagation(self):
-        shapes = self._propagate_shapes(mutate=False)
+    def _validate_shape_propagation(self, strict: bool = True):
+        try:
+            shapes = self._propagate_shapes(mutate=False, strict=strict)
+        except Exception as e:
+            if strict:
+                raise e
+            return
 
         output_sources = [edge.source for edge in self.edges if edge.target == "output"]
         if output_sources:
             final_shape = shapes.get(output_sources[0])
             if final_shape and not self._shapes_compatible(final_shape, self.output_shape):
-                raise ValueError(
-                    f"Output shape mismatch: propagated {final_shape}, expected {self.output_shape}"
-                )
+                if strict:
+                    raise ValueError(
+                        f"Output shape mismatch: propagated {final_shape}, expected {self.output_shape}"
+                    )
 
-    def _propagate_shapes(self, mutate: bool) -> Dict[str, List[int]]:
+    def _propagate_shapes(self, mutate: bool, strict: bool = True) -> Dict[str, List[int]]:
         shapes: Dict[str, List[int]] = {"input": list(self.input_shape)}
-        sorted_nodes = self._topological_node_order()
+        try:
+            sorted_nodes = self._topological_node_order()
+        except Exception as e:
+            if strict:
+                raise e
+            return shapes
 
         for node_id in sorted_nodes:
             node = next(n for n in self.nodes if n.id == node_id)
@@ -168,36 +181,46 @@ class ArchitectureDescriptor:
             if not input_shapes:
                 continue
 
-            in_shape = input_shapes[0] if len(input_shapes) == 1 else self._merge_shapes(input_shapes, node)
-            in_features = self._infer_in_features(node, in_shape)
+            try:
+                in_shape = input_shapes[0] if len(input_shapes) == 1 else self._merge_shapes(input_shapes, node, strict=strict)
+                in_features = self._infer_in_features(node, in_shape)
 
-            if node.type == "Linear":
-                expected = node.params.get("in_features")
-                if expected is not None and expected != in_features and not mutate:
-                    raise ValueError(f"Linear node {node.id} expects in_features={expected}, got {in_features}")
-                if mutate:
-                    node.params["in_features"] = in_features
-            elif node.type in ("Conv1d", "Conv2d"):
-                expected = node.params.get("in_channels")
-                if expected is not None and expected != in_features and not mutate:
-                    raise ValueError(f"{node.type} node {node.id} expects in_channels={expected}, got {in_features}")
-                if mutate:
-                    node.params["in_channels"] = in_features
-            elif node.type in ("LSTM", "GRU"):
-                expected = node.params.get("input_size")
-                if expected is not None and expected != in_features and not mutate:
-                    raise ValueError(f"{node.type} node {node.id} expects input_size={expected}, got {in_features}")
-                if mutate:
-                    node.params["input_size"] = in_features
-            elif node.type in ("BatchNorm1d", "BatchNorm2d"):
-                expected = node.params.get("num_features")
-                if expected is not None and expected != in_features and not mutate:
-                    raise ValueError(f"{node.type} node {node.id} expects num_features={expected}, got {in_features}")
-                if mutate:
-                    node.params["num_features"] = in_features
+                if node.type == "Linear":
+                    expected = node.params.get("in_features")
+                    if expected is not None and expected != in_features and not mutate:
+                        if strict:
+                            raise ValueError(f"Linear node {node.id} expects in_features={expected}, got {in_features}")
+                    if mutate:
+                        node.params["in_features"] = in_features
+                elif node.type in ("Conv1d", "Conv2d"):
+                    expected = node.params.get("in_channels")
+                    if expected is not None and expected != in_features and not mutate:
+                        if strict:
+                            raise ValueError(f"{node.type} node {node.id} expects in_channels={expected}, got {in_features}")
+                    if mutate:
+                        node.params["in_channels"] = in_features
+                elif node.type in ("LSTM", "GRU"):
+                    expected = node.params.get("input_size")
+                    if expected is not None and expected != in_features and not mutate:
+                        if strict:
+                            raise ValueError(f"{node.type} node {node.id} expects input_size={expected}, got {in_features}")
+                    if mutate:
+                        node.params["input_size"] = in_features
+                elif node.type in ("BatchNorm1d", "BatchNorm2d"):
+                    expected = node.params.get("num_features")
+                    if expected is not None and expected != in_features and not mutate:
+                        if strict:
+                            raise ValueError(f"{node.type} node {node.id} expects num_features={expected}, got {in_features}")
+                    if mutate:
+                        node.params["num_features"] = in_features
 
-            out_shape = self._infer_output_shape(node, in_shape)
-            shapes[node_id] = out_shape
+                out_shape = self._infer_output_shape(node, in_shape)
+                shapes[node_id] = out_shape
+            except Exception as e:
+                if strict:
+                    raise e
+                if input_shapes:
+                    shapes[node_id] = input_shapes[0]
 
         return shapes
 
@@ -243,7 +266,7 @@ class ArchitectureDescriptor:
                 collected.append(shapes[edge.source])
         return collected
 
-    def _merge_shapes(self, input_shapes: List[List[int]], node: Node) -> List[int]:
+    def _merge_shapes(self, input_shapes: List[List[int]], node: Node, strict: bool = True) -> List[int]:
         if len(input_shapes) <= 1:
             return input_shapes[0]
 
@@ -251,7 +274,8 @@ class ArchitectureDescriptor:
             reference = input_shapes[0]
             for candidate in input_shapes[1:]:
                 if not self._shapes_compatible(candidate, reference):
-                    raise ValueError(f"Add node {node.id} requires compatible input shapes")
+                    if strict:
+                        raise ValueError(f"Add node {node.id} requires compatible input shapes")
             return list(reference)
 
         if node.type == "Concat":
@@ -259,18 +283,23 @@ class ArchitectureDescriptor:
             rank = len(input_shapes[0])
             concat_dim = concat_dim if concat_dim >= 0 else rank + concat_dim
             if concat_dim < 0 or concat_dim >= rank:
-                raise ValueError(f"Concat node {node.id} has invalid dim {node.params.get('dim', -1)}")
+                if strict:
+                    raise ValueError(f"Concat node {node.id} has invalid dim {node.params.get('dim', -1)}")
+                return list(input_shapes[0])
 
             reference = list(input_shapes[0])
             total = reference[concat_dim]
             for candidate in input_shapes[1:]:
                 if len(candidate) != rank:
-                    raise ValueError(f"Concat node {node.id} requires matching ranks")
+                    if strict:
+                        raise ValueError(f"Concat node {node.id} requires matching ranks")
+                    continue
                 for index, (ref_dim, cand_dim) in enumerate(zip(reference, candidate)):
                     if index == concat_dim:
                         continue
                     if ref_dim != -1 and cand_dim != -1 and ref_dim != cand_dim:
-                        raise ValueError(f"Concat node {node.id} requires matching non-concat dimensions")
+                        if strict:
+                            raise ValueError(f"Concat node {node.id} requires matching non-concat dimensions")
                 if total == -1 or candidate[concat_dim] == -1:
                     total = -1
                 else:
@@ -280,7 +309,9 @@ class ArchitectureDescriptor:
             output[concat_dim] = total
             return output
 
-        raise ValueError(f"Node {node.id} received multiple inputs but type {node.type} is not an explicit merge op")
+        if strict:
+            raise ValueError(f"Node {node.id} received multiple inputs but type {node.type} is not an explicit merge op")
+        return list(input_shapes[0])
 
     def _infer_output_shape(self, node: Node, in_shape: List[int]) -> List[int]:
         params = node.params

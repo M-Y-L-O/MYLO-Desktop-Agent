@@ -13,6 +13,7 @@ from Processing.Models.DescriptorHandling import (
     descriptorToGraph,
     descriptorToDetailedGraph,
     descriptorToHybridGraph,
+    descriptorToOnnx,
     loadDescriptorFromBytes,
     extractStateDict,
 )
@@ -324,7 +325,7 @@ def _validate_with_drafts(
 ) -> None:
     if strict:
         # Legacy behavior: every node must be valid and connected
-        descriptor.validate()
+        descriptor.validate(strict=True)
         return
 
     # Lenient mode: only validate the active (reachable) subgraph
@@ -332,25 +333,26 @@ def _validate_with_drafts(
 
     if not draft_ids:
         # No draft nodes — validate everything normally
-        descriptor.validate()
+        descriptor.validate(strict=False)
         return
 
     # Extract active subgraph and validate it
     active = _get_active_subgraph(descriptor)
 
     if active.nodes:
-        active.validate()
+        active.validate(strict=False)
 
 
 def _propagate_shapes_with_drafts(
-    descriptor: ArchitectureDescriptor
+    descriptor: ArchitectureDescriptor,
+    strict: bool = False
 ) -> Dict[str, Any]:
     draft_ids = _get_draft_node_ids(descriptor)
 
     if not draft_ids:
         # No drafts — normal shape propagation
         try:
-            return {k: v for k, v in descriptor._propagate_shapes(mutate=False).items()}
+            return {k: v for k, v in descriptor._propagate_shapes(mutate=False, strict=strict).items()}
         except Exception:
             return {}
 
@@ -358,7 +360,7 @@ def _propagate_shapes_with_drafts(
     active = _get_active_subgraph(descriptor)
 
     try:
-        active_shapes = active._propagate_shapes(mutate=False)
+        active_shapes = active._propagate_shapes(mutate=False, strict=strict)
     except Exception:
         active_shapes = {}
 
@@ -420,9 +422,9 @@ def validateDescriptorPayload(descriptor_dict: Dict[str, Any], strict: bool = Fa
     """
     try:
         descriptor = ArchitectureDescriptor.from_dict(descriptor_dict)
-        descriptor.normalize_inplace()
+        descriptor.normalize_inplace(strict=strict)
         _validate_with_drafts(descriptor, strict=strict)
-        shapes = _propagate_shapes_with_drafts(descriptor)
+        shapes = _propagate_shapes_with_drafts(descriptor, strict=strict)
         return {
             "valid": True,
             "descriptor": descriptor.to_dict(),
@@ -503,21 +505,24 @@ class ModelEditEngine:
                 return result
 
             try:
-                working.normalize_inplace()
+                working.normalize_inplace(strict=strict)
             except Exception as e:
                 logger.warning("Bypassing shape propagation/normalization error inside edit apply: %s", e)
 
             try:
-                working.validate()
+                working.validate(strict=strict)
             except Exception as e:
                 logger.warning("Bypassing validation error inside edit apply: %s", e)
 
-            working.normalize_inplace()
+            try:
+                working.normalize_inplace(strict=strict)
+            except Exception as e:
+                logger.warning("Bypassing second shape propagation/normalization error inside edit apply: %s", e)
 
             # --- KEY CHANGE: use draft-aware validation ---
             _validate_with_drafts(working, strict=strict)
 
-            shapes = _propagate_shapes_with_drafts(working)
+            shapes = _propagate_shapes_with_drafts(working, strict=strict)
             draft_ids = _get_draft_node_ids(working)
 
             return {
@@ -960,10 +965,10 @@ def checkEdgeCompatibility(
                     "error": "Edge already exists"}
 
         descriptor.edges.append(Edge(source=source, target=target, source_port=source_port, target_port=target_port))
-        descriptor.normalize_inplace()
+        descriptor.normalize_inplace(strict=False)
         _validate_with_drafts(descriptor, strict=False)
 
-        shapes = _propagate_shapes_with_drafts(descriptor)
+        shapes = _propagate_shapes_with_drafts(descriptor, strict=False)
         return {
             "compatible": True,
             "sourceShape": shapes.get(source),
@@ -1117,3 +1122,55 @@ def _sync_weights_after_edit(descriptor: ArchitectureDescriptor) -> Optional[Dic
     except Exception as exc:
         logger.warning("Weight sync after edit failed: %s", exc)
         return None
+
+
+def exportUploadedPt2ToOnnx(pt2_filename: str, previous_onnx_filename: str = "") -> Dict[str, Any]:
+    """Build the uploaded PT2 into an ONNX file for the uploaded ONNX slot."""
+    if not pt2_filename:
+        return {"error": "No uploaded PT2 model found"}
+
+    pt2_path = project_path(pt2_filename)
+    if not os.path.exists(pt2_path):
+        return {"error": f"PT2 file not found: {pt2_filename}"}
+
+    try:
+        descriptor = loadProjectDescriptor(pt2_filename)
+        descriptor.validate()
+    except Exception as exc:
+        return {"error": f"Invalid PT2 descriptor: {exc}"}
+
+    try:
+        model = DescriptorModelBuilder.build(descriptor)
+    except Exception as exc:
+        return {"error": f"Failed to build model from PT2: {exc}"}
+
+    with open(pt2_path, "rb") as f:
+        state_dict = extractStateDict(f.read(), is_pytorch=True)
+    if state_dict:
+        WeightCompatibilityEngine.transfer_weights(state_dict, model)
+
+    stem = os.path.splitext(os.path.basename(pt2_filename))[0] or "model"
+    onnx_filename = f"{stem}.onnx"
+    onnx_path = project_path(onnx_filename)
+
+    if previous_onnx_filename and previous_onnx_filename != onnx_filename:
+        previous_path = project_path(previous_onnx_filename)
+        if os.path.exists(previous_path):
+            os.remove(previous_path)
+
+    try:
+        descriptorToOnnx(model, descriptor, onnx_path)
+    except Exception as exc:
+        logger.exception("ONNX export from uploaded PT2 failed")
+        return {"error": f"ONNX export failed: {exc}"}
+
+    if not os.path.exists(onnx_path):
+        return {"error": f"ONNX export did not create file: {onnx_filename}"}
+
+    return {
+        "success": True,
+        "onnxFile": onnx_filename,
+        "path": onnx_filename,
+        "name": onnx_filename,
+        "exists": True,
+    }

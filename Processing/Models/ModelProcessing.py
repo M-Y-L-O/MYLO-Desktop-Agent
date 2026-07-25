@@ -14,8 +14,8 @@ def _try_extract_descriptor(model_bytes: bytes, is_pytorch: bool):
             input_dim=1,
             output_dim=1,
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 def _pytorch_visualization_response(filePath: str, message: str, has_state_dict: bool = False):
@@ -49,6 +49,8 @@ def analyseModel(filePath: str, originalFilename: str = "", weightsPath: str = "
 
     if filename.endswith(".pt2"):
         descriptor = _try_extract_descriptor(model_bytes, True)
+        if isinstance(descriptor, dict) and "error" in descriptor:
+            return descriptor
         if not descriptor:
             return {"error": "Invalid .pt2 descriptor"}
         saveDescriptorToProject(descriptor)
@@ -56,6 +58,8 @@ def analyseModel(filePath: str, originalFilename: str = "", weightsPath: str = "
 
     if weights_present:
         descriptor = _try_extract_descriptor(model_bytes, False)
+        if isinstance(descriptor, dict) and "error" in descriptor:
+            return descriptor
         if not descriptor:
             return {"error": "Descriptor extraction failed for model + weights upload"}
         saveDescriptorToProject(descriptor)
@@ -84,7 +88,10 @@ def analyseModel(filePath: str, originalFilename: str = "", weightsPath: str = "
             pass
 
         descriptor = _try_extract_descriptor(model_bytes, True)
-        if descriptor:
+        if isinstance(descriptor, dict) and "error" in descriptor:
+            # Binary torch files may fail JSON parse; fall through to limited viz
+            pass
+        elif descriptor:
             saveDescriptorToProject(descriptor)
             return descriptorToGraph(descriptor)
 

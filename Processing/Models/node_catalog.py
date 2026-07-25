@@ -666,7 +666,9 @@ OPERATION_SCHEMAS = {
     }
 }
 
-# Model architectural templates for starting designs
+# Model architectural templates for starting designs.
+# IMPORTANT: "input" and "output" are virtual terminals in ArchitectureDescriptor —
+# do not create real nodes with those ids. Wire edges from "input" → … → "output".
 TEMPLATES = {
     "mlp_classifier": {
         "label": "MLP Classifier (Tabular)",
@@ -676,7 +678,6 @@ TEMPLATES = {
             "input_shape": [-1, 64],
             "output_shape": [-1, 10],
             "nodes": [
-                {"id": "input",  "type": "Input", "params": {}},
                 {"id": "flat",   "type": "Flatten",  "params": {"start_dim": 1}},
                 {"id": "fc1",    "type": "Linear",   "params": {"in_features": 64, "out_features": 128}},
                 {"id": "relu1",  "type": "ReLU",     "params": {}},
@@ -693,6 +694,7 @@ TEMPLATES = {
                 {"source": "drop1", "target": "fc2", "source_port": "output", "target_port": "input"},
                 {"source": "fc2",   "target": "relu2", "source_port": "output", "target_port": "input"},
                 {"source": "relu2", "target": "out", "source_port": "output", "target_port": "input"},
+                {"source": "out",   "target": "output", "source_port": "output", "target_port": "input"},
             ],
         },
     },
@@ -704,7 +706,6 @@ TEMPLATES = {
             "input_shape": [-1, 10, 64],
             "output_shape": [-1, 1],
             "nodes": [
-                {"id": "input", "type": "Input", "params": {}},
                 {"id": "lstm1", "type": "LSTM", "params": {"input_size": 64, "hidden_size": 128, "batch_first": True}},
                 {"id": "relu", "type": "ReLU", "params": {}},
                 {"id": "out", "type": "Linear", "params": {"in_features": 128, "out_features": 1}},
@@ -713,7 +714,8 @@ TEMPLATES = {
                 {"source": "input", "target": "lstm1", "source_port": "output", "target_port": "input"},
                 {"source": "lstm1", "target": "relu", "source_port": "output", "target_port": "input"},
                 {"source": "relu", "target": "out", "source_port": "output", "target_port": "input"},
-            ]
+                {"source": "out", "target": "output", "source_port": "output", "target_port": "input"},
+            ],
         },
     },
     "cnn_classifier": {
@@ -724,14 +726,18 @@ TEMPLATES = {
             "input_shape": [-1, 1, 128],
             "output_shape": [-1, 5],
             "nodes": [
-                {"id": "input", "type": "Input", "params": {}},
+                {"id": "conv1", "type": "Conv1d", "params": {"in_channels": 1, "out_channels": 16, "kernel_size": 1}},
+                {"id": "relu1", "type": "ReLU", "params": {}},
                 {"id": "flat", "type": "Flatten", "params": {"start_dim": 1}},
-                {"id": "fc", "type": "Linear", "params": {"in_features": 128, "out_features": 5}},
+                {"id": "fc", "type": "Linear", "params": {"in_features": 2048, "out_features": 5}},
             ],
             "edges": [
-                {"source": "input", "target": "flat", "source_port": "output", "target_port": "input"},
+                {"source": "input", "target": "conv1", "source_port": "output", "target_port": "input"},
+                {"source": "conv1", "target": "relu1", "source_port": "output", "target_port": "input"},
+                {"source": "relu1", "target": "flat", "source_port": "output", "target_port": "input"},
                 {"source": "flat", "target": "fc", "source_port": "output", "target_port": "input"},
-            ]
+                {"source": "fc", "target": "output", "source_port": "output", "target_port": "input"},
+            ],
         },
     },
 }

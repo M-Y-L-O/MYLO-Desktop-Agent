@@ -23,6 +23,8 @@ def descriptorToOnnx(model, descriptor, outputPath, device=None):
         "output": {0: "batch_size"},
     }
 
+    # dynamo=False: legacy exporter. The dynamo path can fail on Windows consoles
+    # (Unicode logging) and is unnecessary for these descriptor models.
     torch.onnx.export(
         modelCpu,
         dummyInput,
@@ -34,7 +36,11 @@ def descriptorToOnnx(model, descriptor, outputPath, device=None):
         do_constant_folding=True,
         export_params=True,
         training=torch.onnx.TrainingMode.EVAL,
+        dynamo=False,
     )
+
+    if not os.path.exists(outputPath):
+        raise FileNotFoundError(f"ONNX export reported success but file missing: {outputPath}")
 
     onnx.checker.check_model(outputPath)
     print(f"ONNX model exported to {outputPath}")
@@ -329,12 +335,14 @@ def loadDescriptorFromBytes(model_bytes, is_pytorch: bool, input_dim: int, outpu
 
     try:
         payload = json.loads(model_bytes.decode("utf-8"))
-        if isinstance(payload, dict) and "nodes" in payload:
-            descriptor = ArchitectureDescriptor.from_dict(payload)
-            descriptor.validate()
-            return descriptor
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, KeyError):
-        pass
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        payload = None
+
+    if isinstance(payload, dict) and "nodes" in payload:
+        # Explicit JSON architecture (.pt2 descriptor) — do not silently fall back
+        descriptor = ArchitectureDescriptor.from_dict(payload)
+        descriptor.validate()
+        return descriptor
 
     if is_pytorch:
         temp_in = createTempFile(model_bytes, ".pt")
