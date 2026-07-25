@@ -16,6 +16,7 @@ import pandas as pd
 from Processing.Optimization.Optimizing import startOptimization
 from Types.Types import *
 from Processing.Models.ModelProcessing import analyseModel
+from Processing.Models.ModelDiagnostics import generateModelDiagnostics
 from Processing.Models.ModelEditing import (
     loadProjectDescriptor,
     validateDescriptorPayload,
@@ -46,6 +47,7 @@ from Utils.FileHandler import saveFile
 from Utils.Other import make_json_serializable
 
 
+
 # ---------------- GLOBAL STATE ----------------
 
 CurrentSession = SessionData()
@@ -57,10 +59,11 @@ MIDDLEWARE_EXCEPTIONS = ["/", "/initialize", "/docs", "/openapi.json", "/optimiz
 
 REPORT_FILENAME = "optimization_report.json"
 
+# ---------------- SETUP ----------------
+
 load_dotenv()
 
 
-# ---------------- SETUP ----------------
 
 app = FastAPI(title="MYLO AGENT", version="0.2.2")
 
@@ -71,6 +74,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 # ---------------- HELPERS ----------------
@@ -381,6 +385,36 @@ async def visualizeProjectFile(request: Request):
         return JSONResponse({"error": str(e)}, 500)
 
 
+@app.post("/modelDiagnostics")
+async def modelDiagnostics(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    try:
+        descriptor = loadProjectDescriptor(CurrentProject.modelFilepath)
+        result = generateModelDiagnostics(
+            descriptor,
+            weights_path=getattr(CurrentProject, "weightsFilepath", ""),
+            export_name=body.get("exportName", "model_diagnostics.onnx"),
+            report_name=body.get("reportName", "model_diagnostics_report.json"),
+            mode=body.get("mode", "dummy"),
+            csv_path=project_path(CurrentProject.csvFilepath) if CurrentProject.csvFilepath else "",
+            input_features=body.get("inputFeatures", []),
+            output_features=body.get("outputFeatures", body.get("targetFeature", [])),
+            epochs=body.get("epochs", 10),
+            problem_type=body.get("problemType", "regression"),
+            batch_size=body.get("batchSize", 32),
+            validation_split=body.get("validationSplit", 0.2),
+            learning_rate=body.get("learningRate", 0.001),
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, 500)
+
+
+
 # ---------------- MODEL EDITOR ----------------
 
 @app.post("/getModelDescriptor")
@@ -530,7 +564,7 @@ async def compileModelDescriptor(request: Request):
                          "Connect draft nodes or remove them.",
             }, 400)
 
-        # No draft nodes — do full strict validation
+        # Draft-free graphs use strict validation.
         try:
             descriptor.validate()
             shapes = descriptor._propagate_shapes(mutate=False)
@@ -856,7 +890,6 @@ async def optimizeModel(request: Request):
             CurrentProject.optimizedOnnxFilepath = os.path.basename(optimized_onnx_path)
         CurrentProject.dumpInTemp()
 
-        # Final structured event for SSE listeners (carries the headline numbers)
         queue.append({
             "type": "complete",
             "status": "Optimization complete",
@@ -884,7 +917,6 @@ async def optimizationStatus(request: Request):
                 message = queue.pop(0)
                 yield f"data: {json.dumps(message)}\n\n"
             elif not optimizing:
-                # Queue drained and the worker finished — tell the client and close.
                 yield f"data: {json.dumps({'type': 'done', 'status': 'Optimization finished', 'progress': 100})}\n\n"
                 break
             await asyncio.sleep(0.1)
@@ -912,7 +944,6 @@ async def newProject(request: Request):
     shutil.rmtree("temp_export", ignore_errors=True)
     os.makedirs("temp_export", exist_ok=True)
 
-    # Clear project-scoped history
     _ProjectHistory.clear_project()
 
     global CurrentProject
@@ -1028,7 +1059,6 @@ async def loadProject(file: UploadFile = File(...)):
         shutil.rmtree("temp_export", ignore_errors=True)
         os.makedirs("temp_export", exist_ok=True)
 
-        # Clear old project history when loading a new project
         _ProjectHistory.clear_project()
 
         temp_path = await saveFile(file, path="temp_export")

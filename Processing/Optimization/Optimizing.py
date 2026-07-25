@@ -18,9 +18,9 @@ from Core.AdaptedModel import AdaptedModel
 
 logger = logging.getLogger(__name__)
 
-NEUROEVOLUTION_POPULATION_SIZE = 30
+NEUROEVOLUTION_POPULATION_SIZE = 15
 
-SUPPORTED_STRATEGIES = ("optuna", "neuroevolution") # Orice altceva se duce la default
+SUPPORTED_STRATEGIES = ("optuna", "neuroevolution")
 DEFAULT_STRATEGY = "neuroevolution"
 
 REPORT_FILENAME = "optimization_report.json"
@@ -40,21 +40,26 @@ def _temp_project_path(filename: str) -> str:
     return os.path.join(_repo_root(), "temp_project", filename)
 
 
+def _suggest_population_size(device) -> int:
+    """Suggest an efficient population size based on device to accelerate evolution."""
+    dev_str = str(device).lower()
+    if "cpu" in dev_str:
+        return 12
+    return 20
+
+
 def _suggest_batch_size(device, dataset_size, descriptor):
     """Auto-tune batch size based on device and model complexity."""
     if device.type == "cpu":
-        return 32
+        return min(128, max(64, dataset_size // 8))
 
-    # Estimate model memory footprint
     param_count = sum(
         n.params.get("out_features", 64) * n.params.get("in_features", 64)
         for n in descriptor.nodes if n.type == "Linear"
     )
 
-    # Start conservative, could be made smarter with actual GPU memory query
     base_batch = min(128, max(32, dataset_size // 8))
 
-    # Reduce batch for large models
     if param_count > 1000000:
         base_batch = max(16, base_batch // 2)
     if param_count > 5000000:
@@ -176,13 +181,14 @@ def _build_engine(strategy, initial_descriptor, requestInfo, statusCallback):
 
         return "optuna", run, summary_builder
 
-    # Default: neuroevolution
     statusCallback({"type": "phase", "phase": "optimizing", "status": "Using neuroevolution optimization...", "progress": 42})
 
-    
+    device = getDevice()
+    pop_size = _suggest_population_size(device)
+
     engine = NeuroevolutionEngine(
         initial_descriptor,
-        population_size=NEUROEVOLUTION_POPULATION_SIZE,
+        population_size=pop_size,
         statusCallback=statusCallback,
     )
     n_generations = _request_generations(requestInfo)
@@ -204,7 +210,7 @@ def _build_engine(strategy, initial_descriptor, requestInfo, statusCallback):
         improvement = d.get("improvement") or {}
         return {
             "generations": n_generations,
-            "population_size": NEUROEVOLUTION_POPULATION_SIZE,
+            "population_size": pop_size,
             "best_train_loss": d.get("best_train_loss"),
             "best_val_loss": d.get("best_val_loss"),
             "best_score": d.get("best_score"),
@@ -292,7 +298,7 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         modelBytes = readBinary(model_path)
         device = getDevice()
 
-        # Cap CPU threads so we don't fight the executor pool
+        # Avoid CPU contention with the executor.
         torch.set_num_threads(min(4, os.cpu_count() or 4))
 
         if df is None or df.empty:
@@ -324,7 +330,6 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
 
         statusCallback({"type": "phase", "phase": "data_pipeline", "status": "Preparing leakage-free data pipeline...", "progress": 35})
 
-        # Auto-tune batch size based on model size and available memory
         batch_size = _suggest_batch_size(device, len(df), initialDescriptor)
 
         pipeline = DataPipeline.prepare_data(
@@ -354,12 +359,10 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
 
         initialDescriptor.validate()
 
-        # Snapshot the true "before" architecture for the diff/report
         original_descriptor_dict = initialDescriptor.to_dict()
 
         statusCallback({"type": "phase", "phase": "optimizing", "status": "Starting optimization...", "progress": 40})
 
-        # Strategy dispatch -- each branch is fully self-contained in _build_engine.
         strategy, run_search, build_summary = _build_engine(
             strategy=_normalize_strategy(getattr(requestInfo, "strategy", None)),
             initial_descriptor=initialDescriptor,
@@ -375,7 +378,6 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             problem_type=problem_type,
         )
 
-        # Validate descriptor/model shape alignment; fall back to adapter on mismatch.
         expected_input = best_descriptor.input_shape[-1]
         actual_input = pipeline.input_shape[-1]
         expected_output = best_descriptor.output_shape[-1]

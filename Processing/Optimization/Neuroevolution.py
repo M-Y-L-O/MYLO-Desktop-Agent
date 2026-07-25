@@ -52,7 +52,6 @@ class GenerationStats:
     activation_mutations: int = 0
     hyperparam_mutations: int = 0
     layer_swap_mutations: int = 0
-    # Failure tracking
     shape_errors: int = 0
     nan_errors: int = 0
     other_errors: int = 0
@@ -154,11 +153,10 @@ class MutationGrammar:
             t for t in MutationGrammar.ACTIVATION_TYPES if t != node.type]
         old_type = node.type
         node.type = random.choice(choices)
-        # Sync node ID to match new type — but preserve edge connectivity
+        # Rename the node without breaking edges.
         old_id = node.id
         new_id = f"{node.type.lower()}_{old_id.split('_')[-1]}"
         node.id = new_id
-        # Update all edge references to point to the new ID
         for edge in descriptor.edges:
             if edge.source == old_id:
                 edge.source = new_id
@@ -187,7 +185,6 @@ class MutationGrammar:
         if not node or node.type != "Dropout":
             return False
         current_p = node.params.get("p", 0.2)
-        # Bias toward small changes
         delta = random.choice([-0.1, -0.05, 0.0, 0.05, 0.1])
         new_p = max(0.0, min(0.8, round(current_p + delta, 2)))
         node.params["p"] = new_p
@@ -214,7 +211,7 @@ class MutationGrammar:
 
         old_type = node.type
         other_type = "GRU" if node.type == "LSTM" else "LSTM"
-        # Preserve key dimensions
+        # Keep dimensions compatible.
         input_size = node.params.get(
             "input_size", node.params.get(
                 "in_features", 64))
@@ -229,7 +226,7 @@ class MutationGrammar:
             "num_layers": num_layers,
             "batch_first": batch_first,
         }
-        # Sync node ID to match new type — preserve edge connectivity
+        # Rename the node without breaking edges.
         old_id = node.id
         new_id = f"{node.type.lower()}_{old_id.split('_')[-1]}"
         node.id = new_id
@@ -263,7 +260,6 @@ class MutationGrammar:
 
         embed_dim = node.params.get("embed_dim", 64)
         current_heads = node.params.get("num_heads", 2)
-        # Valid head counts that divide embed_dim
         valid_heads = [
             h for h in [
                 1, 2, 4, 8, 16] if embed_dim %
@@ -293,8 +289,6 @@ class MutationGrammar:
         if not after_node:
             return False
 
-        # Don't normalize single-dimensional outputs or nodes right before
-        # output
         out_dim = MutationGrammar._get_node_output_dim(
             descriptor, after_node_id)
         if out_dim is None or out_dim <= 1:
@@ -305,7 +299,6 @@ class MutationGrammar:
         if not outgoing_edges:
             return False
 
-        # Check if any outgoing edge points to 'output' node
         if any(e.target == "output" for e in outgoing_edges):
             return False  # Don't insert norms right before output
 
@@ -439,7 +432,6 @@ class MutationGrammar:
         if node.id in ["input", "output"]:
             return False
 
-        # Protect backbone structural nodes from removal
         if protected_types is None:
             protected_types = {"LSTM", "GRU", "MultiheadAttention"}
         if node.type in protected_types:
@@ -524,7 +516,7 @@ class MutationGrammar:
         if not incoming_edges:
             return False
 
-        # Prevent duplicate skip connections to the same target
+        # Skip duplicate residual connections.
         existing_skips = [
             e for e in descriptor.edges if e.target == to_id and e.source != max(
                 incoming_edges, key=lambda e: levels.get(
@@ -549,7 +541,6 @@ class MutationGrammar:
         descriptor.edges.append(Edge(source=from_id, target=concat_id))
         descriptor.edges.append(Edge(source=concat_id, target=to_id))
 
-        # Deduplicate edges before normalizing
         MutationGrammar._deduplicate_edges(descriptor)
         descriptor.normalize_inplace()
         if event is not None:
@@ -704,7 +695,6 @@ class MutationGrammar:
                     desc, random.choice(nodes), event=event)
             candidates.append(("hyperparam", _mutate_heads))
 
-        # Add norm layer mutation
         if layer_nodes:
             def _add_norm(desc=descriptor, nodes=list(
                     layer_nodes), event=None):
@@ -814,9 +804,9 @@ class MutationGrammar:
 
 class TieredEvaluator:
     TIER1_EPOCHS = 3
-    TIER2_EPOCHS = 8
+    TIER2_EPOCHS = 5
     FINALS_EPOCHS = 15
-    EARLY_STOPPING_PATIENCE = 3
+    EARLY_STOPPING_PATIENCE = 2
 
     @staticmethod
     def evaluate(
@@ -827,6 +817,7 @@ class TieredEvaluator:
         num_epochs: int,
         device: str = "cpu",
         val_loader=None,
+        max_allowed_loss: float = float("inf"),
     ) -> Tuple[float, List[float], List[float]]:
         """Train model and return (final_train_loss, train_loss_history, val_loss_history)."""
         model.to(device)
@@ -860,13 +851,18 @@ class TieredEvaluator:
             avg_loss = epoch_loss / max(batches, 1)
             losses.append(avg_loss)
 
-            if val_loader is not None:
+            # Prune weak candidates after the first epoch.
+            if num_epochs <= TieredEvaluator.TIER1_EPOCHS and epoch == 0 and max_allowed_loss < float("inf"):
+                if avg_loss > max_allowed_loss:
+                    return avg_loss, losses, val_losses
+
+            should_validate = val_loader is not None and (num_epochs > TieredEvaluator.TIER1_EPOCHS or epoch == num_epochs - 1)
+            if should_validate:
                 val_loss = TieredEvaluator.validate(
                     model, val_loader, criterion, device)
                 val_losses.append(val_loss)
                 model.train()
-                # Early stopping still only kicks in after a couple of epochs
-                if epoch >= 2:
+                if epoch >= 1:
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         patience_counter = 0
@@ -942,7 +938,6 @@ class NeuroevolutionEngine:
         self.original_descriptor_json: str = initial_descriptor.to_json()
         self._best_model_state: Optional[Dict[str, torch.Tensor]] = None
         self._best_descriptor: Optional[ArchitectureDescriptor] = None
-        # --- NEW: mutation/lineage tracking + metrics state ---
         self._mutation_events: List[Dict[str, Any]] = []
         self._ancestry: Dict[int, Dict[str, Any]] = {}
         self._next_individual_id: int = 0
@@ -951,7 +946,6 @@ class NeuroevolutionEngine:
         self._start_time: Optional[float] = None
         self._active_callback: Optional[callable] = None
 
-    # --- Lineage / event helpers ----------------------------------------
 
     @staticmethod
     def _get_meta(desc: ArchitectureDescriptor) -> Dict[str, Any]:
@@ -960,8 +954,7 @@ class NeuroevolutionEngine:
 
     @staticmethod
     def _set_meta(desc: ArchitectureDescriptor, meta: Dict[str, Any]) -> None:
-        # Relies on ArchitectureDescriptor allowing attribute assignment.
-        # Fails silently — lineage is a nice-to-have, never a blocker.
+        # Lineage metadata is optional.
         try:
             setattr(desc, "_evo_meta", meta)
         except Exception:
@@ -1037,7 +1030,6 @@ class NeuroevolutionEngine:
                 out.append(v)
         return out
 
-    # --- Metric collection (baseline & champion) -------------------------
 
     def _collect_model_metrics(
         self,
@@ -1061,7 +1053,6 @@ class NeuroevolutionEngine:
         except Exception as e:
             logger.debug(f"Metric collection (structure) failed: {e}")
 
-        # --- Latency ---
         try:
             model.to(device)
             model.eval()
@@ -1091,7 +1082,6 @@ class NeuroevolutionEngine:
         except Exception as e:
             logger.debug(f"Metric collection (latency) failed: {e}")
 
-        # --- Validation loss ---
         try:
             val_loss = TieredEvaluator.validate(
                 model, data_loader, criterion, device)
@@ -1104,7 +1094,6 @@ class NeuroevolutionEngine:
         except Exception as e:
             logger.debug(f"Metric collection (val loss) failed: {e}")
 
-        # --- Predictions + problem metrics ---
         try:
             model.eval()
             y_true: List[Any] = []
@@ -1226,15 +1215,13 @@ class NeuroevolutionEngine:
         self._ancestry = {}
         self._next_individual_id = 0
 
-        # Always preserve the original architecture unmutated (lineage root,
-        # id=0)
+        # Keep an untouched lineage root.
         original = copy.deepcopy(self.initial_descriptor)
         self._set_meta(original, {"id": 0, "parent": None, "generation": 1})
         self._ancestry[0] = {"parent": None, "generation": 1, "mutations": []}
         self._root_desc = original
         self.population = [(original, parent_state_dict)]
 
-        # Add a lightly mutated copy to explore near the original
         light_mutant = copy.deepcopy(self.initial_descriptor)
         self._mutate_and_track(
             light_mutant,
@@ -1422,10 +1409,13 @@ class NeuroevolutionEngine:
                 "progress": _progress(gen),
             })
 
-            # -- Tier 1: 3-epoch screen -------------------------------------
             tier1_results = []
-            for desc, parent_state in self.population:
+
+            def _eval_single_candidate(item):
+                desc, parent_state = item
                 try:
+                    if str(device).lower() == "cpu":
+                        torch.set_num_threads(1)
                     desc.validate()
                     model = self._build_model_with_weights(desc, parent_state)
                     model.to(device)
@@ -1434,7 +1424,11 @@ class NeuroevolutionEngine:
                     optimizer = torch.optim.Adam(
                         model.parameters(), lr=lr, weight_decay=1e-5)
 
-                    train_loss, _, _ = TieredEvaluator.evaluate(
+                    prune_threshold = float("inf")
+                    if not math.isinf(best_train_loss):
+                        prune_threshold = max(best_train_loss * 4.0, 10.0)
+
+                    train_loss, _, val_history = TieredEvaluator.evaluate(
                         model,
                         train_loader,
                         criterion,
@@ -1442,48 +1436,50 @@ class NeuroevolutionEngine:
                         num_epochs=TieredEvaluator.TIER1_EPOCHS,
                         device=device,
                         val_loader=val_loader,
+                        max_allowed_loss=prune_threshold,
                     )
 
                     if train_loss == float("inf") or math.isnan(train_loss):
-                        stats.nan_errors += 1
-                        continue
+                        return None, "nan"
 
                     if self._has_nan_weights(model):
-                        stats.nan_errors += 1
-                        continue
+                        return None, "nan"
 
-                    # FIX: Use validation loss for Tier 1 scoring if available
-                    if val_loader is not None:
-                        val_loss = TieredEvaluator.validate(
-                            model, val_loader, criterion, device)
-                        model.train()  # Restore training mode
-                        score_loss = val_loss
-                    else:
-                        score_loss = train_loss
-
+                    score_loss = val_history[-1] if (val_loader is not None and val_history) else train_loss
                     score = self._score(
                         score_loss, model, complexity_penalty, desc)
-                    # Store trained state dict for warm-starting Tier 2
                     trained_state = model.state_dict()
-                    tier1_results.append(
-                        (desc, trained_state, train_loss, score, model, []))
+                    return (desc, trained_state, train_loss, score, model, []), None
                 except RuntimeError as e:
-                    if "shape" in str(e).lower() or "size" in str(e).lower():
-                        stats.shape_errors += 1
-                    else:
-                        stats.other_errors += 1
-                    logger.debug(
-                        f"Tier 1 eval failed: {
-                            type(e).__name__}: {e}")
-                    stats.tier1_failures += 1
-                    continue
+                    err_type = "shape" if ("shape" in str(e).lower() or "size" in str(e).lower()) else "other"
+                    logger.debug(f"Tier 1 eval failed: {type(e).__name__}: {e}")
+                    return None, err_type
                 except Exception as e:
-                    stats.other_errors += 1
-                    logger.debug(
-                        f"Tier 1 eval failed: {
-                            type(e).__name__}: {e}")
+                    logger.debug(f"Tier 1 eval failed: {type(e).__name__}: {e}")
+                    return None, "other"
+
+            import concurrent.futures
+            max_workers = 1
+            if str(device).lower() == "cpu":
+                max_workers = min(4, max(1, (os.cpu_count() or 4) // 2))
+
+            if max_workers > 1 and len(self.population) > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    eval_out = list(executor.map(_eval_single_candidate, self.population))
+            else:
+                eval_out = [_eval_single_candidate(item) for item in self.population]
+
+            for res, err_type in eval_out:
+                if res is not None:
+                    tier1_results.append(res)
+                elif err_type == "nan":
+                    stats.nan_errors += 1
+                elif err_type == "shape":
+                    stats.shape_errors += 1
                     stats.tier1_failures += 1
-                    continue
+                elif err_type == "other":
+                    stats.other_errors += 1
+                    stats.tier1_failures += 1
 
             if not tier1_results:
                 logger.warning(f"Generation {gen + 1}: No survivors in Tier 1")
@@ -1507,22 +1503,21 @@ class NeuroevolutionEngine:
                 "progress": _progress(gen) + (50 / max(generations, 1)) * 0.33,
             })
 
-            # -- Tier 2: 8-epoch eval of top candidates ----------------------
-            tier2_count = max(4, self.population_size // 2)
-            tier2_results = []
+            tier2_count = max(3, self.population_size // 3)
 
-            for desc, trained_state, _, _, model, _ in tier1_results[:tier2_count]:
+            def _eval_tier2_candidate(item):
+                desc, trained_state, _, _, _, _ = item
                 try:
-                    # FIX: Warm-start Tier 2 with trained weights from Tier 1
-                    tier2_model = self._build_model_with_weights(
-                        desc, trained_state)
+                    if str(device).lower() == "cpu":
+                        torch.set_num_threads(1)
+                    tier2_model = self._build_model_with_weights(desc, trained_state)
                     tier2_model.to(device)
 
                     lr = self._suggest_lr(desc)
                     optimizer = torch.optim.Adam(
                         tier2_model.parameters(), lr=lr, weight_decay=1e-5)
 
-                    train_loss, loss_history, _ = TieredEvaluator.evaluate(
+                    train_loss, loss_history, val_history = TieredEvaluator.evaluate(
                         tier2_model,
                         train_loader,
                         criterion,
@@ -1533,53 +1528,45 @@ class NeuroevolutionEngine:
                     )
 
                     if train_loss == float("inf") or math.isnan(train_loss):
-                        stats.nan_errors += 1
-                        continue
+                        return None, "nan"
 
                     if self._has_nan_weights(tier2_model):
-                        stats.nan_errors += 1
-                        continue
+                        return None, "nan"
 
-                    # FIX: Use validation loss for Tier 2 scoring
-                    if val_loader is not None:
-                        val_loss = TieredEvaluator.validate(
-                            tier2_model, val_loader, criterion, device)
-                        tier2_model.train()
-                        score_loss = val_loss
-                    else:
-                        score_loss = train_loss
-
+                    score_loss = val_history[-1] if (val_loader is not None and val_history) else train_loss
                     score = self._score(
                         score_loss, tier2_model, complexity_penalty, desc)
-                    # Store trained state for Finals warm-start
                     tier2_trained_state = tier2_model.state_dict()
-                    tier2_results.append(
-                        (desc, tier2_trained_state, train_loss, score, tier2_model, loss_history))
+                    return (desc, tier2_trained_state, train_loss, score, tier2_model, loss_history), None
                 except RuntimeError as e:
-                    if "shape" in str(e).lower() or "size" in str(e).lower():
-                        stats.shape_errors += 1
-                    else:
-                        stats.other_errors += 1
-                    logger.error(
-                        f"Tier 2 eval failed: {
-                            type(e).__name__}: {e}")
-                    logger.debug(traceback.format_exc())
-                    stats.tier2_failures += 1
-                    continue
+                    err_type = "shape" if ("shape" in str(e).lower() or "size" in str(e).lower()) else "other"
+                    return None, err_type
                 except Exception as e:
-                    stats.other_errors += 1
-                    logger.error(
-                        f"Tier 2 eval failed: {
-                            type(e).__name__}: {e}")
-                    logger.debug(traceback.format_exc())
+                    return None, "other"
+
+            if max_workers > 1 and len(tier1_results[:tier2_count]) > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    t2_out = list(executor.map(_eval_tier2_candidate, tier1_results[:tier2_count]))
+            else:
+                t2_out = [_eval_tier2_candidate(item) for item in tier1_results[:tier2_count]]
+
+            tier2_results = []
+            for res, err_type in t2_out:
+                if res is not None:
+                    tier2_results.append(res)
+                elif err_type == "nan":
+                    stats.nan_errors += 1
+                elif err_type == "shape":
+                    stats.shape_errors += 1
                     stats.tier2_failures += 1
-                    continue
+                elif err_type == "other":
+                    stats.other_errors += 1
+                    stats.tier2_failures += 1
 
             tier2_results.sort(key=lambda item: item[3])
             stats.tier2_survivors = len(tier2_results)
 
-            # Select finalists from Tier 2
-            finalists = tier2_results[:3] if tier2_results else tier1_results[:3]
+            finalists = tier2_results[:2] if tier2_results else tier1_results[:2]
 
             self._emit({
                 "type": "tier",
@@ -1591,11 +1578,9 @@ class NeuroevolutionEngine:
                 "progress": _progress(gen) + (50 / max(generations, 1)) * 0.66,
             })
 
-            # -- Finals: full training of top 3 -----------------------------
             finals_best_score = float("inf")
             for desc, trained_state, _, _, model, _ in finalists:
                 try:
-                    # FIX: Warm-start Finals with trained weights from Tier 2
                     finals_model = self._build_model_with_weights(
                         desc, trained_state)
                     finals_model.to(device)
@@ -1604,8 +1589,7 @@ class NeuroevolutionEngine:
                     optimizer = torch.optim.Adam(
                         finals_model.parameters(), lr=lr, weight_decay=1e-5)
 
-                    finals_epochs = max(
-                        max_epochs, TieredEvaluator.FINALS_EPOCHS)
+                    finals_epochs = min(10, max(max_epochs, TieredEvaluator.FINALS_EPOCHS))
                     train_loss, finals_train_history, finals_val_history = TieredEvaluator.evaluate(
                         finals_model,
                         train_loader,
@@ -1616,8 +1600,7 @@ class NeuroevolutionEngine:
                         val_loader=eval_loader,
                     )
 
-                    val_loss = TieredEvaluator.validate(
-                        finals_model, eval_loader, criterion, device=device)
+                    val_loss = finals_val_history[-1] if (eval_loader is not None and finals_val_history) else train_loss
 
                     if train_loss == float("inf") or math.isnan(
                             train_loss) or val_loss == float("inf") or math.isnan(val_loss):
@@ -1628,7 +1611,6 @@ class NeuroevolutionEngine:
                         stats.nan_errors += 1
                         continue
 
-                    # Use validation loss for scoring
                     effective_score = self._score(
                         val_loss, finals_model, complexity_penalty, desc)
 
@@ -1643,8 +1625,6 @@ class NeuroevolutionEngine:
                         best_val_loss = val_loss
                         self._best_model_state = finals_model.state_dict()
                         self._best_descriptor = copy.deepcopy(desc)
-                        # Capture the champion's full training curves for the
-                        # report
                         self._champion_training = {
                             "train_loss_history": self._sanitize_history(finals_train_history),
                             "val_loss_history": self._sanitize_history(finals_val_history),
@@ -1717,15 +1697,12 @@ class NeuroevolutionEngine:
                 "progress": _progress(gen + 1),
             })
 
-            # -- Reproduction: elites + mutated offspring ---------------------
-            # FIX: Elite selection from Tier 2 (more reliable than Tier 1)
             elite_count = max(3, self.population_size // 5)
             elite = tier2_results[:elite_count] if tier2_results else tier1_results[:elite_count]
 
             new_population = []
 
-            # FIX: Preserve top 1-2 elites completely unmutated (architectural
-            # memory)
+            # Carry the best elites forward unchanged.
             preserved_elite_count = min(2, len(elite))
             for i in range(preserved_elite_count):
                 elite_desc = copy.deepcopy(elite[i][0])
@@ -1737,7 +1714,6 @@ class NeuroevolutionEngine:
                         1} unmutated (score={
                         elite[i][3]:.6f})")
 
-            # Mutate remaining elites lightly
             for i in range(preserved_elite_count, len(elite)):
                 elite_desc = copy.deepcopy(elite[i][0])
                 elite_sd = elite[i][4].state_dict()
@@ -1760,7 +1736,6 @@ class NeuroevolutionEngine:
                                           num_mutations=num_mutations, stats=stats) > 0:
                     new_population.append((child, parent_sd))
 
-            # -- Diversity: structural speciation ----------------------------
             species_best = {}
             for item in tier2_results:
                 species = self._get_species(item[0])
@@ -1773,12 +1748,10 @@ class NeuroevolutionEngine:
                 desc_json = item[0].to_json()
                 if not any(p[0].to_json() ==
                            desc_json for p in new_population):
-                    # Same individual re-entering — deepcopy keeps its lineage
-                    # meta
+                    # Deepcopy retains lineage metadata.
                     new_population.append(
                         (copy.deepcopy(item[0]), item[4].state_dict()))
 
-            # -- Stagnation recovery -----------------------------------------
             if self._is_stagnant(window=5, relative_threshold=0.02):
                 logger.info(
                     f"Stagnation detected at generation {
@@ -1791,7 +1764,6 @@ class NeuroevolutionEngine:
                 })
                 inject_count = max(5, self.population_size // 3)
 
-                # Strategy 1: Mutate from best with higher mutation count
                 for _ in range(inject_count // 2):
                     if len(new_population) >= self.population_size:
                         break
@@ -1801,8 +1773,7 @@ class NeuroevolutionEngine:
                                                num_mutations=random.randint(4, 8), stats=stats)
                         new_population.append((fresh, self._best_model_state))
 
-                # Strategy 2: Reset to original descriptor with fresh mutations
-                # This prevents getting stuck in a local architectural minimum
+                # Restart from the baseline after stagnation.
                 for _ in range(inject_count // 2):
                     if len(new_population) >= self.population_size:
                         break
@@ -1811,7 +1782,6 @@ class NeuroevolutionEngine:
                                            num_mutations=random.randint(2, 5), stats=stats)
                     new_population.append((fresh, parent_state_dict))
 
-            # Fill remaining with mutated elites
             while len(new_population) < self.population_size:
                 elite_choice = random.choice(elite)
                 parent_desc = elite_choice[0]
@@ -1841,7 +1811,6 @@ class NeuroevolutionEngine:
                     stats.finals_failures}"
             )
 
-        # -- Baseline vs champion measurement -------------------------------
         self._emit({
             "type": "phase",
             "phase": "measuring",
@@ -1880,7 +1849,6 @@ class NeuroevolutionEngine:
             mutation_timeline = mutation_timeline[:2000]
             timeline_truncated = True
 
-        # -- Build diagnostics ----------------------------------------------
         diagnostics = {
             "original_descriptor": json.loads(self.original_descriptor_json),
             "generation_stats": [s.to_dict() for s in self.generation_stats],
@@ -1896,7 +1864,6 @@ class NeuroevolutionEngine:
             "total_shape_errors": sum(s.shape_errors for s in self.generation_stats),
             "total_nan_errors": sum(s.nan_errors for s in self.generation_stats),
             "total_other_errors": sum(s.other_errors for s in self.generation_stats),
-            # --- reporting payload ---
             "population_size": self.population_size,
             "generations_run": generations,
             "elapsed_seconds": elapsed_seconds,

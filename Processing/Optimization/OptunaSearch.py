@@ -28,10 +28,9 @@ try:
         TPESampler,
     )
     OPTUNA_AVAILABLE = True
-except ImportError:  # pragma: no cover - we guard usage
+except ImportError:  # pragma: no cover
     OPTUNA_AVAILABLE = False
 
-# Reuse everything the previous code already imported successfully
 from Core.ArchitectureDescriptor import ArchitectureDescriptor, Node, Edge
 from Core.DescriptorModelBuilder import DescriptorModelBuilder
 from Core.WeightCompatibilityEngine import WeightCompatibilityEngine
@@ -44,9 +43,6 @@ from Processing.Optimization.Neuroevolution import (
 logger = logging.getLogger(__name__)
 
 
-# -----------------------------------------------------------------------------
-# Trial-level diagnostics
-# -----------------------------------------------------------------------------
 @dataclass
 class TrialRecord:
     """Per-trial statistics, surfaced through the final diagnostics dict."""
@@ -71,18 +67,11 @@ class TrialRecord:
         }
 
 
-# -----------------------------------------------------------------------------
-# ArchitectureEncoder kept for diagnostics/back-compat only.
-# The Optuna path does NOT need it for the surrogate (Optuna handles
-# parameterization internally), but the previous code's diagnostics
-# referenced an "original_descriptor" field, so we keep the import path
-# working without forcing sklearn at runtime.
-# -----------------------------------------------------------------------------
+# Lightweight compatibility encoder; Optuna does not use it for search.
 def _safe_encode_architecture(descriptor: ArchitectureDescriptor) -> Optional[np.ndarray]:
     """Best-effort architecture fingerprint for diagnostics. Returns None on failure."""
     try:
-        # Lightweight feature fingerprint: node-type histogram + width stats.
-        # Avoid sklearn dependency; the previous ArchitectureEncoder required it.
+        # Feature fingerprint without a sklearn dependency.
         type_counts: Dict[str, int] = {}
         widths: List[int] = []
         for n in descriptor.nodes:
@@ -108,9 +97,6 @@ def _safe_encode_architecture(descriptor: ArchitectureDescriptor) -> Optional[np
         return None
 
 
-# -----------------------------------------------------------------------------
-# Structured search space
-# -----------------------------------------------------------------------------
 class ArchitectureSearchSpace:
     """
     Maps Optuna Trial hyperparameter suggestions to mutations on an
@@ -149,44 +135,37 @@ class ArchitectureSearchSpace:
         descriptor = copy.deepcopy(base)
         params: Dict[str, Any] = {}
 
-        # 1) Width scaling
         params["width_multiplier"] = trial.suggest_categorical(
             "width_multiplier", cls.WIDTH_CHOICES
         )
         cls._apply_width(descriptor, params["width_multiplier"])
 
-        # 2) Depth delta
         params["depth_delta"] = trial.suggest_int(
             "depth_delta", cls.DEPTH_RANGE[0], cls.DEPTH_RANGE[1]
         )
         cls._apply_depth(descriptor, params["depth_delta"])
 
-        # 3) Activation
         params["activation"] = trial.suggest_categorical(
             "activation", cls.ACTIVATION_CHOICES
         )
         cls._apply_activation(descriptor, params["activation"])
 
-        # 4) Dropout
         params["dropout_rate"] = trial.suggest_float(
             "dropout_rate", cls.DROPOUT_RANGE[0], cls.DROPOUT_RANGE[1], step=0.05
         )
         cls._apply_dropout(descriptor, params["dropout_rate"])
 
-        # 5) Normalization
         params["normalization"] = trial.suggest_categorical(
             "normalization", cls.NORM_CHOICES
         )
         cls._apply_normalization(descriptor, params["normalization"])
 
-        # 6) Skip / residual connections (only if depth allows)
         params["use_skip"] = trial.suggest_categorical("use_skip", [True, False])
         if params["use_skip"] and params["depth_delta"] >= -1:
             cls._maybe_add_skip(descriptor)
         elif not params["use_skip"]:
             cls._remove_skip_nodes(descriptor)
 
-        # 7) Training hyperparameters (per-trial, so each trial has its own budget)
         params["learning_rate"] = trial.suggest_float(
             "learning_rate", cls.LR_LOG_RANGE[0], cls.LR_LOG_RANGE[1], log=True
         )
@@ -197,16 +176,13 @@ class ArchitectureSearchSpace:
             "optimizer", cls.OPTIMIZER_CHOICES
         )
 
-        # 8) Optional: warm-start LR for transfer-learning scenarios
-        # Only meaningful if the parent has weights, but we always suggest it;
-        # warm-start factor just rescales the LR.
+        # Warm-start factor is inert without parent weights.
         params["warm_start_factor"] = trial.suggest_float(
             "warm_start_factor", 0.1, 1.0, step=0.1
         )
 
         return descriptor, params
 
-    # ---- mutation helpers --------------------------------------------------
     @staticmethod
     def _apply_width(descriptor: ArchitectureDescriptor, mult: float) -> None:
         """Scale channel / feature sizes by `mult` (clamped to >= 8)."""
@@ -217,8 +193,7 @@ class ArchitectureSearchSpace:
                 node.params["out_channels"] = max(8, int(round(node.params["out_channels"] * mult)))
             elif node.type in ("LSTM", "GRU") and "hidden_size" in node.params:
                 node.params["hidden_size"] = max(8, int(round(node.params["hidden_size"] * mult)))
-            # Update downstream in_features for next Linear layer connected
-            # by an edge (topology-aware width propagation)
+            # Propagate width changes through connected Linear layers.
             if node.type == "Linear" and "out_features" in node.params:
                 for edge in descriptor.edges:
                     if edge.source == node.id:
@@ -232,7 +207,6 @@ class ArchitectureSearchSpace:
         if delta == 0:
             return
 
-        # Identify a "template" hidden node we can duplicate or remove.
         hidden_candidates = [
             n for n in descriptor.nodes
             if n.id not in ("input", "output")
@@ -242,20 +216,18 @@ class ArchitectureSearchSpace:
             return
 
         if delta > 0:
-            # Insert new layer(s) before the last hidden layer (or output edge)
-            # Find the last hidden node (deepest by topological order assumption)
+            # Insert before the deepest hidden layer.
             insertion_anchor = hidden_candidates[-1]
             for i in range(delta):
                 new_node = copy.deepcopy(insertion_anchor)
                 new_node.id = f"{insertion_anchor.id}_optuna_dup_{i}"
-                # Slightly perturb to avoid identical duplicates
+                # Avoid identical duplicates.
                 if "out_features" in new_node.params:
                     new_node.params["out_features"] = max(8, int(new_node.params["out_features"] * 0.9))
                 elif "out_channels" in new_node.params:
                     new_node.params["out_channels"] = max(8, int(new_node.params["out_channels"] * 0.9))
                 descriptor.nodes.append(new_node)
         else:
-            # Remove `|delta|` of the deepest hidden layers
             removable = sorted(
                 hidden_candidates,
                 key=lambda n: ArchitectureSearchSpace._node_depth(n, descriptor),
@@ -271,14 +243,13 @@ class ArchitectureSearchSpace:
     @staticmethod
     def _node_depth(node: Node, descriptor: ArchitectureDescriptor) -> int:
         """Heuristic depth: count of incoming edges from input/output side."""
-        # Cheap proxy: longer id strings tend to be deeper, plus look at edges
+        # Node IDs provide a cheap depth proxy.
         incoming = sum(1 for e in descriptor.edges if e.target == node.id)
         return incoming
 
     @staticmethod
     def _apply_activation(descriptor: ArchitectureDescriptor, activation: str) -> None:
         """Replace all activation nodes with the chosen activation type."""
-        # Mapping: "leaky_relu" -> "LeakyReLU" etc.
         canon = {
             "relu": "ReLU",
             "gelu": "GELU",
@@ -298,7 +269,6 @@ class ArchitectureSearchSpace:
         """Set dropout rate on all Dropout nodes; insert one if none exists."""
         dropout_nodes = [n for n in descriptor.nodes if n.type == "Dropout"]
         if not dropout_nodes:
-            # Insert a single Dropout node after the last activation
             activations = [
                 n for n in descriptor.nodes
                 if n.type in ("ReLU", "GELU", "SiLU", "Tanh", "Sigmoid", "LeakyReLU", "ELU")
@@ -317,7 +287,7 @@ class ArchitectureSearchSpace:
     @staticmethod
     def _apply_normalization(descriptor: ArchitectureDescriptor, choice: str) -> None:
         """Insert or replace normalization layers."""
-        # First, remove any existing norm nodes AND their connected edges
+        # Remove existing normalization nodes and their edges.
         norm_types = ("BatchNorm1d", "BatchNorm2d", "LayerNorm")
         removed_ids = {n.id for n in descriptor.nodes if n.type in norm_types}
         descriptor.nodes = [n for n in descriptor.nodes if n.type not in norm_types]
@@ -334,7 +304,7 @@ class ArchitectureSearchSpace:
             has_conv = any("Conv" in n.type for n in descriptor.nodes)
             norm_type = "BatchNorm2d" if has_conv else "BatchNorm1d"
 
-        # Insert one norm node per linear/conv layer (bounded to avoid explosion)
+        # Bound normalization insertion to control graph growth.
         insert_targets = [
             n for n in descriptor.nodes
             if n.type in ("Linear", "Conv1d", "Conv2d", "LSTM", "GRU")
@@ -353,7 +323,6 @@ class ArchitectureSearchSpace:
         has_add = any(n.type == "Add" for n in descriptor.nodes)
         if has_add:
             return
-        # Find two Linear/Conv nodes to bridge
         linears = [n for n in descriptor.nodes if n.type in ("Linear", "Conv1d", "Conv2d")]
         if len(linears) < 2:
             return
@@ -376,9 +345,7 @@ class ArchitectureSearchSpace:
         ]
 
 
-# -----------------------------------------------------------------------------
-# Score function (preserved from previous Bayesian code for back-compat)
-# -----------------------------------------------------------------------------
+# Legacy-compatible score.
 def _model_complexity(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -433,9 +400,6 @@ def _score_with_penalty(
     return score
 
 
-# -----------------------------------------------------------------------------
-# Main engine
-# -----------------------------------------------------------------------------
 class OptunaSearchEngine:
     """
     Optuna-based architecture search. Drop-in replacement for BayesianSearchEngine.
@@ -482,7 +446,6 @@ class OptunaSearchEngine:
         self.epochs_per_trial = max(1, int(epochs_per_trial))
         self.statusCallback = statusCallback or (lambda *_a, **_kw: None)
 
-        # --- Sampler --------------------------------------------------------
         if sampler_type == "tpe":
             self.sampler: optuna.samplers.BaseSampler = TPESampler(
                 n_startup_trials=n_startup_trials,
@@ -505,7 +468,6 @@ class OptunaSearchEngine:
         else:
             raise ValueError(f"Unknown sampler_type: {sampler_type}")
 
-        # --- Pruner ---------------------------------------------------------
         if pruner_type == "hyperband":
             self.pruner: optuna.pruners.BasePruner = HyperbandPruner(
                 min_resource=min_resource,
@@ -527,9 +489,6 @@ class OptunaSearchEngine:
         else:
             raise ValueError(f"Unknown pruner_type: {pruner_type}")
 
-        # --- Study ----------------------------------------------------------
-        # Suppress Optuna's verbose logging -- the surrounding app has its own
-        # status callback. Keep warnings/errors.
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
         self.study = optuna.create_study(
@@ -538,7 +497,6 @@ class OptunaSearchEngine:
             pruner=self.pruner,
         )
 
-        # --- Bookkeeping ----------------------------------------------------
         self.trial_records: List[TrialRecord] = []
         self.pruned_count = 0
         self.completed_count = 0
@@ -553,7 +511,6 @@ class OptunaSearchEngine:
         self.best_model_state: Optional[Dict[str, torch.Tensor]] = None
         self.best_params: Optional[Dict[str, Any]] = None
 
-    # ------------------------------------------------------------------ utils
     @staticmethod
     def _build_model_with_weights(
         descriptor: ArchitectureDescriptor,
@@ -577,7 +534,6 @@ class OptunaSearchEngine:
             return torch.optim.SGD(params, lr=lr, weight_decay=weight_decay, momentum=0.9)
         return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
 
-    # -------------------------------------------------------- per-epoch train
     def _train_one_epoch(
         self,
         model: nn.Module,
@@ -590,7 +546,6 @@ class OptunaSearchEngine:
         total_loss = 0.0
         n_batches = 0
         for batch in loader:
-            # Support both (x, y) and (x, y, ...) shapes
             if isinstance(batch, (list, tuple)):
                 x, y = batch[0], batch[1]
             else:
@@ -604,7 +559,7 @@ class OptunaSearchEngine:
             if torch.isnan(loss) or torch.isinf(loss):
                 return float("inf")
             loss.backward()
-            # Gradient clipping for stability with deeper / wider nets
+            # Stabilize large candidates.
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
@@ -641,23 +596,19 @@ class OptunaSearchEngine:
                 model, train_loader, criterion, optimizer, device
             )
             if math.isnan(train_loss) or math.isinf(train_loss):
-                # Bail early on numerical failure
+                # Stop on numerical failure.
                 return float("inf"), float("inf"), epoch
 
             val_loss = TieredEvaluator.validate(model, eval_loader, criterion, device)
             if math.isnan(val_loss) or math.isinf(val_loss):
                 return float("inf"), float("inf"), epoch
 
-            # Restore train mode for next epoch
             model.train()
 
             score = _score_with_penalty(val_loss, model, complexity_penalty, descriptor)
             epochs_completed = epoch + 1
 
-            # Report to Optuna for pruning. We use the *raw* val_loss (not
-            # the score) as the pruning signal because val_loss is on a
-            # comparable scale across architectures, whereas the complexity
-            # penalty makes the score architecture-dependent.
+            # Raw validation loss is comparable across architectures.
             trial.report(val_loss, step=epoch)
 
             if trial.should_prune():
@@ -671,13 +622,11 @@ class OptunaSearchEngine:
                     k: v.detach().clone() for k, v in model.state_dict().items()
                 }
 
-        # Restore best weights observed during training
         if best_state is not None:
             model.load_state_dict(best_state)
 
         return best_score, best_val, best_train, epochs_completed
 
-    # ---------------------------------------------------------------- objective
     def _objective(
         self,
         trial: "optuna.Trial",
@@ -690,13 +639,10 @@ class OptunaSearchEngine:
         problem_type: str,
         complexity_penalty: float,
     ) -> float:
-        # 1) Sample architecture + training hparams
         descriptor, params = ArchitectureSearchSpace.suggest(trial, self.initial_descriptor)
         try:
             descriptor.validate()
         except Exception as e:
-            # Structured mutations produced an invalid descriptor; fall back
-            # to MutationGrammar so the trial is not wasted.
             logger.debug(
                 f"Structured descriptor invalid ({e}); falling back to MutationGrammar"
             )
@@ -714,21 +660,19 @@ class OptunaSearchEngine:
                 logger.debug(f"Fallback descriptor invalid, pruning trial: {e2}")
                 raise optuna.TrialPruned()
 
-        # 2) Build the model
         try:
             model = self._build_model_with_weights(descriptor, parent_state_dict)
         except Exception as e:
             logger.debug(f"Model build failed, pruning trial: {e}")
             raise optuna.TrialPruned()
 
-        # Warm-start LR scaling (smaller LR for fine-tuning from parent)
+        # Lower the learning rate when reusing parent weights.
         lr = params["learning_rate"] * params["warm_start_factor"]
         optimizer = self._make_optimizer(
             params["optimizer"], model.parameters(), lr, params["weight_decay"]
         )
         model.to(device)
 
-        # 3) Train with pruning
         try:
             score, val_loss, best_train, epochs_completed = self._train_with_pruning(
                 trial,
@@ -751,8 +695,6 @@ class OptunaSearchEngine:
         if _has_nan_weights(model):
             raise optuna.TrialPruned()
 
-        # 4) Bookkeeping
-        # Compute train_loss at the loaded best-val weights for diagnostics
         train_loss = TieredEvaluator.validate(
             model, train_loader, criterion, device
         )
@@ -789,7 +731,6 @@ class OptunaSearchEngine:
 
         return score
 
-    # ----------------------------------------------------------------- search
     def search(
         self,
         train_loader,
@@ -822,7 +763,6 @@ class OptunaSearchEngine:
 
         start_time = time.time()
 
-        # Wrap the objective so we can inject context
         def _wrapped(trial: "optuna.Trial") -> float:
             self.statusCallback({
                 "status": f"Optuna trial {trial.number + 1}/{self.n_trials}",
@@ -840,7 +780,7 @@ class OptunaSearchEngine:
                 complexity_penalty=complexity_penalty,
             )
 
-        # Custom callback to count pruned/failed trials for diagnostics
+        # Track pruned and failed trials.
         def _state_callback(study: "optuna.Study", trial_: "optuna.trial.FrozenTrial") -> None:
             if trial_.state == optuna.trial.TrialState.PRUNED:
                 self.pruned_count += 1
@@ -849,7 +789,7 @@ class OptunaSearchEngine:
             elif trial_.state == optuna.trial.TrialState.COMPLETE:
                 self.completed_count += 1
 
-        # Suppress optuna-internal exception spam for pruned trials
+        # Hide expected pruning exceptions.
         try:
             self.study.optimize(
                 _wrapped,
@@ -862,7 +802,6 @@ class OptunaSearchEngine:
 
         elapsed = time.time() - start_time
 
-        # Count trials by final state (more reliable than callback counters)
         from optuna.trial import TrialState as _TS
         self.completed_count = sum(
             1 for t in self.study.trials if t.state == _TS.COMPLETE
@@ -874,14 +813,11 @@ class OptunaSearchEngine:
             1 for t in self.study.trials if t.state == _TS.FAIL
         )
 
-        # Build final model with best weights
         best_model = self._build_model_with_weights(
             self.best_descriptor, self.best_model_state
         )
 
-        # Diagnostics in the same shape as BayesianSearchEngine for back-compat
-        # Note: we omit original_descriptor because Optuna does not need a
-        # surrogate-encoded feature vector; the trial records carry enough info.
+        # Keep the legacy diagnostics schema.
         diagnostics: Dict[str, Any] = {
             "strategy_used": "optuna_search",
             "n_trials_requested": self.n_trials,
