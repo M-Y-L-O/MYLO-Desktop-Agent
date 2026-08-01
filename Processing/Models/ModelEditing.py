@@ -2,6 +2,7 @@ import copy
 import json
 import logging
 import os
+import tempfile
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -129,7 +130,21 @@ def loadProjectDescriptor(model_filepath: str = "") -> ArchitectureDescriptor:
     with open(full_path, "rb") as f:
         model_bytes = f.read()
 
-    is_pytorch = model_filepath.lower().endswith((".pt", ".pth", ".pt2"))
+    is_pytorch = model_filepath.lower().endswith((".pt", ".pth", ".pt2", ".ptpkg", ".torchpackage"))
+    if model_filepath.lower().endswith(".pt2"):
+        try:
+            from Processing.Models.TorchExportProcessing import (
+                NotTorchExportArtifact,
+                TorchExportImportError,
+                import_torch_export,
+            )
+            descriptor, _, _ = import_torch_export(full_path)
+            saveProjectDescriptor(descriptor)
+            return descriptor
+        except NotTorchExportArtifact:
+            pass
+        except TorchExportImportError:
+            raise
     descriptor = loadDescriptorFromBytes(model_bytes, is_pytorch, input_dim=1, output_dim=1)
     saveProjectDescriptor(descriptor)
     return descriptor
@@ -1117,7 +1132,25 @@ def _sync_weights_after_edit(descriptor: ArchitectureDescriptor) -> Optional[Dic
             "state_dict": model.state_dict(),
         }
         out_path = project_path(model_filepath)
-        torch.save(checkpoint, out_path)
+        from Processing.Models.TorchPackageProcessing import (
+            export_mylo_torch_package,
+            is_torch_package_archive,
+        )
+        if is_torch_package_archive(read_path):
+            fd, temporary_path = tempfile.mkstemp(
+                prefix="mylo_package_",
+                suffix=os.path.splitext(out_path)[1] or ".ptpkg",
+                dir=os.path.dirname(out_path) or ".",
+            )
+            os.close(fd)
+            try:
+                export_mylo_torch_package(model, descriptor, temporary_path)
+                os.replace(temporary_path, out_path)
+            finally:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
+        else:
+            torch.save(checkpoint, out_path)
         return transfer_report
     except Exception as exc:
         logger.warning("Weight sync after edit failed: %s", exc)

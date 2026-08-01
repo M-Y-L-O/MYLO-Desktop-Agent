@@ -192,7 +192,7 @@ class ArchitectureDescriptor:
                             raise ValueError(f"Linear node {node.id} expects in_features={expected}, got {in_features}")
                     if mutate:
                         node.params["in_features"] = in_features
-                elif node.type in ("Conv1d", "Conv2d"):
+                elif node.type in ("Conv1d", "Conv2d", "ConvTranspose1d", "ConvTranspose2d"):
                     expected = node.params.get("in_channels")
                     if expected is not None and expected != in_features and not mutate:
                         if strict:
@@ -225,7 +225,7 @@ class ArchitectureDescriptor:
         return shapes
 
     def _infer_in_features(self, node: Node, in_shape: List[int]) -> int:
-        if node.type in ("Conv1d", "Conv2d", "BatchNorm1d", "BatchNorm2d"):
+        if node.type in ("Conv1d", "Conv2d", "ConvTranspose1d", "ConvTranspose2d", "BatchNorm1d", "BatchNorm2d"):
             if len(in_shape) >= 2:
                 return in_shape[1]
             return in_shape[-1]
@@ -316,6 +316,31 @@ class ArchitectureDescriptor:
     def _infer_output_shape(self, node: Node, in_shape: List[int]) -> List[int]:
         params = node.params
         batch_prefix = in_shape[:-1] if len(in_shape) > 1 else [in_shape[0] if in_shape else -1]
+
+        def spatial_values(value, rank: int, default: int = 0) -> List[int]:
+            if isinstance(value, str):
+                return [value] * rank
+            if isinstance(value, (list, tuple)):
+                values = list(value)
+                if len(values) == 1:
+                    values *= rank
+                return values[:rank]
+            return [default if value is None else value] * rank
+
+        def conv_dim(size, kernel, stride, padding, dilation, *, transpose=False, output_padding=0, ceil_mode=False):
+            if not isinstance(size, int) or size <= 0:
+                return -1
+            if isinstance(padding, str):
+                if padding.lower() == "same" and not transpose:
+                    return size
+                padding = 0
+            kernel, stride, padding, dilation = int(kernel), int(stride), int(padding), int(dilation)
+            if transpose:
+                return (size - 1) * stride - 2 * padding + dilation * (kernel - 1) + int(output_padding) + 1
+            numerator = size + 2 * padding - dilation * (kernel - 1) - 1
+            if ceil_mode:
+                return int(-(-numerator // stride) + 1)
+            return int(numerator // stride + 1)
 
         def normalize_dim(dim: int, rank: int) -> int:
             return dim if dim >= 0 else rank + dim + 1
@@ -416,20 +441,40 @@ class ArchitectureDescriptor:
 
         if node.type == "Linear":
             return batch_prefix + [params.get("out_features", in_shape[-1])]
-        if node.type in ("Conv1d",):
+        if node.type == "Conv1d":
             out_channels = params.get("out_channels", in_shape[1] if len(in_shape) > 1 else in_shape[-1])
             length = in_shape[2] if len(in_shape) > 2 else -1
-            return [in_shape[0] if in_shape else -1, out_channels, length]
-        if node.type in ("Conv2d",):
+            kernel = spatial_values(params.get("kernel_size", 1), 1, 1)[0]
+            stride = spatial_values(params.get("stride", 1), 1, 1)[0]
+            padding = spatial_values(params.get("padding", 0), 1, 0)[0]
+            dilation = spatial_values(params.get("dilation", 1), 1, 1)[0]
+            return [in_shape[0] if in_shape else -1, out_channels, conv_dim(length, kernel, stride, padding, dilation)]
+        if node.type == "Conv2d":
             out_channels = params.get("out_channels", in_shape[1] if len(in_shape) > 1 else in_shape[-1])
             height = in_shape[2] if len(in_shape) > 2 else -1
             width = in_shape[3] if len(in_shape) > 3 else -1
-            return [in_shape[0] if in_shape else -1, out_channels, height, width]
+            kernel = spatial_values(params.get("kernel_size", 1), 2, 1)
+            stride = spatial_values(params.get("stride", 1), 2, 1)
+            padding = spatial_values(params.get("padding", 0), 2, 0)
+            dilation = spatial_values(params.get("dilation", 1), 2, 1)
+            return [
+                in_shape[0] if in_shape else -1,
+                out_channels,
+                conv_dim(height, kernel[0], stride[0], padding[0], dilation[0]),
+                conv_dim(width, kernel[1], stride[1], padding[1], dilation[1]),
+            ]
         if node.type in ("LSTM", "GRU"):
             hidden = params.get("hidden_size", in_shape[-1])
-            # forward() extracts the last timestep (out[:, -1, :]) so shape is [batch, hidden]
-            batch = in_shape[0] if in_shape else -1
-            return [batch, hidden]
+            batch_first = bool(params.get("batch_first", True))
+            batch = (in_shape[0] if batch_first else in_shape[1]) if len(in_shape) >= 2 else -1
+            output_mode = (getattr(node, "execution", {}) or {}).get("output_mode", "auto")
+            if output_mode == "sequence" and len(in_shape) >= 3:
+                directions = 2 if params.get("bidirectional", False) else 1
+                if batch_first:
+                    return [batch, in_shape[1], hidden * directions]
+                return [in_shape[0], in_shape[1], hidden * directions]
+            directions = 2 if params.get("bidirectional", False) else 1
+            return [batch, hidden * directions]
         if node.type in ("Input", "Output", "Identity", "Add", "Concat", "LayerNorm", "TransformerEncoderLayer"):
             return list(in_shape)
         if node.type == "Reshape":
@@ -440,11 +485,39 @@ class ArchitectureDescriptor:
             return list(in_shape)
         if node.type == "Embedding":
             embedding_dim = params.get("embedding_dim", in_shape[-1])
-            return list(in_shape[:-1]) + [embedding_dim]
+            return list(in_shape) + [embedding_dim]
         if node.type in ("ConvTranspose1d", "ConvTranspose2d"):
-            return batch_prefix + [params.get("out_channels", in_shape[-1])]
+            spatial_rank = 1 if node.type.endswith("1d") else 2
+            out_channels = params.get("out_channels", in_shape[1] if len(in_shape) > 1 else -1)
+            kernel = spatial_values(params.get("kernel_size", 1), spatial_rank, 1)
+            stride = spatial_values(params.get("stride", 1), spatial_rank, 1)
+            padding = spatial_values(params.get("padding", 0), spatial_rank, 0)
+            dilation = spatial_values(params.get("dilation", 1), spatial_rank, 1)
+            output_padding = spatial_values(params.get("output_padding", 0), spatial_rank, 0)
+            spatial = list(in_shape[2:2 + spatial_rank])
+            while len(spatial) < spatial_rank:
+                spatial.append(-1)
+            output_spatial = [
+                conv_dim(spatial[i], kernel[i], stride[i], padding[i], dilation[i],
+                         transpose=True, output_padding=output_padding[i])
+                for i in range(spatial_rank)
+            ]
+            return [in_shape[0] if in_shape else -1, out_channels, *output_spatial]
         if node.type in ("MaxPool1d", "AvgPool1d", "MaxPool2d", "AvgPool2d"):
-            return list(in_shape)
+            spatial_rank = 1 if node.type.endswith("1d") else 2
+            kernel = spatial_values(params.get("kernel_size", 1), spatial_rank, 1)
+            stride = spatial_values(params.get("stride", params.get("kernel_size", 1)), spatial_rank, 1)
+            padding = spatial_values(params.get("padding", 0), spatial_rank, 0)
+            dilation = spatial_values(params.get("dilation", 1), spatial_rank, 1)
+            spatial = list(in_shape[2:2 + spatial_rank])
+            while len(spatial) < spatial_rank:
+                spatial.append(-1)
+            output_spatial = [
+                conv_dim(spatial[i], kernel[i], stride[i], padding[i], dilation[i],
+                         ceil_mode=bool(params.get("ceil_mode", False)))
+                for i in range(spatial_rank)
+            ]
+            return [in_shape[0] if in_shape else -1, in_shape[1] if len(in_shape) > 1 else -1, *output_spatial]
         if node.type == "Flatten":
             start_dim = params.get("start_dim", 1)
             end_dim = params.get("end_dim", -1)

@@ -26,6 +26,35 @@ DEFAULT_STRATEGY = "neuroevolution"
 REPORT_FILENAME = "optimization_report.json"
 
 
+def _adapt_descriptor_to_data_shapes(descriptor, input_shape, output_shape):
+    input_shape = list(input_shape)
+    output_shape = list(output_shape)
+    input_changed = descriptor.input_shape != input_shape
+    output_changed = descriptor.output_shape != output_shape
+
+    if input_changed:
+        descriptor.input_shape = input_shape
+        input_contract = descriptor.tensor_contracts.get("input")
+        if input_contract is not None:
+            input_contract.shape = list(input_shape)
+
+    if output_changed:
+        descriptor.output_shape = output_shape
+        output_nodes = [edge.source for edge in descriptor.edges if edge.target == "output"]
+        if output_nodes:
+            out_node = next((node for node in descriptor.nodes if node.id == output_nodes[0]), None)
+            if out_node is not None and out_node.type == "Linear":
+                out_node.params["out_features"] = output_shape[-1]
+        output_contract = descriptor.tensor_contracts.get("output")
+        if output_contract is not None:
+            output_contract.shape = list(output_shape)
+
+    if input_changed or output_changed:
+        descriptor.normalize_inplace(strict=True)
+    descriptor.validate(strict=True)
+    return descriptor
+
+
 def _repo_root() -> str:
     return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -260,7 +289,7 @@ async def startOptimization(project: ProjectData, requestInfo: OptimizationReque
     requestInfo.inputFeatures = mappedInputFeatures
     requestInfo.targetFeature = mappedTargetFeature
 
-    isPytorchModel = model_path.endswith(".pt") or model_path.endswith(".pth") or model_path.endswith(".pt2")
+    isPytorchModel = model_path.lower().endswith((".pt", ".pth", ".pt2", ".ptpkg", ".torchpackage"))
 
     weightBytes = None
     weightsPath = getattr(project, "weightsFilepath", None)
@@ -341,23 +370,11 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             sequence_length=sequence_length,
         )
 
-        if initialDescriptor.input_shape[-1] != pipeline.input_shape[-1]:
-            initialDescriptor.input_shape = pipeline.input_shape
-            for node in initialDescriptor.nodes:
-                if node.type == "Linear" and any(
-                    edge.source == "input" and edge.target == node.id for edge in initialDescriptor.edges
-                ):
-                    node.params["in_features"] = pipeline.input_shape[-1]
-
-        if initialDescriptor.output_shape[-1] != pipeline.output_shape[-1]:
-            initialDescriptor.output_shape = pipeline.output_shape
-            output_nodes = [edge.source for edge in initialDescriptor.edges if edge.target == "output"]
-            if output_nodes:
-                out_node = next(n for n in initialDescriptor.nodes if n.id == output_nodes[0])
-                if out_node.type == "Linear":
-                    out_node.params["out_features"] = pipeline.output_shape[-1]
-
-        initialDescriptor.validate()
+        _adapt_descriptor_to_data_shapes(
+            initialDescriptor,
+            pipeline.input_shape,
+            pipeline.output_shape,
+        )
 
         original_descriptor_dict = initialDescriptor.to_dict()
 

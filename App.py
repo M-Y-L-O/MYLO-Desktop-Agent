@@ -65,7 +65,7 @@ load_dotenv()
 
 
 
-app = FastAPI(title="MYLO AGENT", version="0.2.2")
+app = FastAPI(title="MYLO AGENT", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -109,7 +109,16 @@ def _slot_entry(key: str, section: str, label: str, filename: str, accept: str, 
 
 def project_slots():
     return [
-        _slot_entry("uploaded_pt2", "uploaded", "Uploaded PT2", CurrentProject.uploadedPt2Filepath, ".pt2", True, True, True),
+        _slot_entry(
+            "uploaded_pt2",
+            "uploaded",
+            "Uploaded PyTorch",
+            CurrentProject.uploadedPt2Filepath,
+            ".pt2,.ptpkg,.torchpackage,.pt,.pth",
+            True,
+            True,
+            True,
+        ),
         _slot_entry("uploaded_onnx", "uploaded", "Uploaded ONNX", CurrentProject.uploadedOnnxFilepath, ".onnx", True, False, True),
         _slot_entry("optimized_pt2", "optimized", "Optimized PT2", CurrentProject.optimizedPt2Filepath, ".pt2", False, False, True),
         _slot_entry("optimized_onnx", "optimized", "Optimized ONNX", CurrentProject.optimizedOnnxFilepath, ".onnx", False, False, True),
@@ -127,8 +136,10 @@ def cleanup_existing_source_models(extension: str):
         return
 
     extension_groups = {
-        ".pt": {".pt", ".pth"},
-        ".pth": {".pt", ".pth"},
+        ".pt": {".pt", ".pth", ".ptpkg", ".torchpackage"},
+        ".pth": {".pt", ".pth", ".ptpkg", ".torchpackage"},
+        ".ptpkg": {".pt", ".pth", ".ptpkg", ".torchpackage"},
+        ".torchpackage": {".pt", ".pth", ".ptpkg", ".torchpackage"},
         ".pt2": {".pt2"},
         ".onnx": {".onnx"},
     }
@@ -149,8 +160,6 @@ def cleanup_existing_source_models(extension: str):
 async def save_uploaded_to_slot(file: UploadFile, previous_filename: str = ""):
     temp_path = await saveFile(file, path="temp_project")
     target_filename = os.path.basename(file.filename or "")
-    if previous_filename and previous_filename != target_filename:
-        clear_slot(previous_filename)
     return target_filename
 
 
@@ -266,27 +275,87 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
     try:
         global CurrentProject
 
+        previous_state = {
+            "modelFilepath": CurrentProject.modelFilepath,
+            "uploadedPt2Filepath": CurrentProject.uploadedPt2Filepath,
+            "uploadedOnnxFilepath": CurrentProject.uploadedOnnxFilepath,
+            "weightsFilepath": getattr(CurrentProject, "weightsFilepath", ""),
+        }
+        saved_paths = []
+        previous_slot_filename = ""
+        replaced_backup = ""
+        weights_replaced_backup = ""
+        metadata_backups = {}
+
+        def rollback_upload():
+            for saved_path in saved_paths:
+                if os.path.exists(saved_path):
+                    os.remove(saved_path)
+            if replaced_backup and os.path.exists(replaced_backup):
+                shutil.move(replaced_backup, project_path(previous_slot_filename))
+            if weights_replaced_backup and os.path.exists(weights_replaced_backup):
+                shutil.move(weights_replaced_backup, project_path(previous_state["weightsFilepath"]))
+            CurrentProject.modelFilepath = previous_state["modelFilepath"]
+            CurrentProject.uploadedPt2Filepath = previous_state["uploadedPt2Filepath"]
+            CurrentProject.uploadedOnnxFilepath = previous_state["uploadedOnnxFilepath"]
+            CurrentProject.weightsFilepath = previous_state["weightsFilepath"]
+            for metadata_name, backup_path in metadata_backups.items():
+                current_path = project_path(metadata_name)
+                if os.path.exists(current_path):
+                    os.remove(current_path)
+                if backup_path and os.path.exists(backup_path):
+                    shutil.move(backup_path, current_path)
+            CurrentProject.dumpInTemp()
+
         uploaded_extension = os.path.splitext(file.filename or "")[1].lower()
-        if uploaded_extension == ".pt2":
+        if uploaded_extension in (".pt2", ".ptpkg", ".torchpackage", ".pt", ".pth"):
+            previous_slot_filename = CurrentProject.uploadedPt2Filepath
+            target_name = os.path.basename(file.filename or "")
+            if previous_slot_filename == target_name and slot_exists(previous_slot_filename):
+                replaced_backup = project_path(f".{target_name}.upload-backup")
+                shutil.copy2(project_path(previous_slot_filename), replaced_backup)
             model_name = await save_uploaded_to_slot(file, CurrentProject.uploadedPt2Filepath)
+            saved_paths.append(project_path(model_name))
             CurrentProject.uploadedPt2Filepath = model_name
             CurrentProject.modelFilepath = model_name
         elif uploaded_extension == ".onnx":
+            previous_slot_filename = CurrentProject.uploadedOnnxFilepath
+            target_name = os.path.basename(file.filename or "")
+            if previous_slot_filename == target_name and slot_exists(previous_slot_filename):
+                replaced_backup = project_path(f".{target_name}.upload-backup")
+                shutil.copy2(project_path(previous_slot_filename), replaced_backup)
             model_name = await save_uploaded_to_slot(file, CurrentProject.uploadedOnnxFilepath)
+            saved_paths.append(project_path(model_name))
             CurrentProject.uploadedOnnxFilepath = model_name
         else:
             return JSONResponse({"error": f"Unsupported model extension: {uploaded_extension}"}, 400)
 
         if weightsFile:
+            weights_target_name = os.path.basename(weightsFile.filename or "")
+            if (
+                weights_target_name
+                and weights_target_name == previous_state["weightsFilepath"]
+                and slot_exists(weights_target_name)
+            ):
+                weights_replaced_backup = project_path(f".{weights_target_name}.upload-backup")
+                shutil.copy2(project_path(weights_target_name), weights_replaced_backup)
             weights_path = await saveFile(weightsFile, path="temp_project")
             CurrentProject.weightsFilepath = os.path.basename(weights_path)
-
-        CurrentProject.dumpInTemp()
+            saved_paths.append(weights_path)
 
         full_model_path = project_path(model_name)
         weights_full_path = ""
         if getattr(CurrentProject, "weightsFilepath", ""):
             weights_full_path = project_path(CurrentProject.weightsFilepath)
+
+        for metadata_name in ("descriptor.json", "modelInfo.json"):
+            metadata_path = project_path(metadata_name)
+            backup_path = project_path(f".{metadata_name}.upload-backup")
+            if os.path.exists(metadata_path):
+                shutil.copy2(metadata_path, backup_path)
+                metadata_backups[metadata_name] = backup_path
+            else:
+                metadata_backups[metadata_name] = ""
 
         result = analyseModel(
             full_model_path,
@@ -294,27 +363,59 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
             weightsPath=weights_full_path,
         )
 
-        if isinstance(result, dict) and "error" in result:
-            raise ValueError(result["error"])
+        if (
+            uploaded_extension in (".pt", ".pth")
+            and isinstance(result, dict)
+            and (result.get("summary") or {}).get("editable") is False
+        ):
+            result = {
+                "error": (
+                    "This .pt/.pth file contains weights or a raw torch.save model but no editable architecture. "
+                    "Upload a torch.package archive or a MYLO checkpoint containing model_config."
+                ),
+                "format": (result.get("summary") or {}).get("format"),
+                "editable": False,
+            }
 
-        with open(project_path("modelInfo.json"), "w") as f:
+        if isinstance(result, dict) and "error" in result:
+            rollback_upload()
+            return JSONResponse(result, 400)
+
+        CurrentProject.dumpInTemp()
+
+        with open(project_path("modelInfo.json"), "w", encoding="utf-8") as f:
             json.dump(result, f)
+
+        if previous_slot_filename and previous_slot_filename != model_name:
+            clear_slot(previous_slot_filename)
+        if replaced_backup and os.path.exists(replaced_backup):
+            os.remove(replaced_backup)
+        if weights_replaced_backup and os.path.exists(weights_replaced_backup):
+            os.remove(weights_replaced_backup)
+        for backup_path in metadata_backups.values():
+            if backup_path and os.path.exists(backup_path):
+                os.remove(backup_path)
 
         return JSONResponse(result)
 
     except Exception as e:
+        if "rollback_upload" in locals():
+            try:
+                rollback_upload()
+            except Exception as rollback_error:
+                print(f"Error rolling back model upload: {rollback_error}")
         print(f"Error in /loadModel: {e}")
         return JSONResponse({"error": str(e)}, 500)
 
 
+@app.post("/generateOnnxFromModel")
 @app.post("/generateOnnxFromPt2")
 async def generateOnnxFromPt2():
-    """Convert the uploaded PT2 into the uploaded ONNX slot."""
     try:
         global CurrentProject
         loadProjectData()
         if not CurrentProject.uploadedPt2Filepath:
-            return JSONResponse({"error": "No uploaded PT2 model found"}, 400)
+            return JSONResponse({"error": "No uploaded editable PyTorch model found"}, 400)
 
         result = exportUploadedPt2ToOnnx(
             CurrentProject.uploadedPt2Filepath,
@@ -396,7 +497,10 @@ async def modelDiagnostics(request: Request):
         descriptor = loadProjectDescriptor(CurrentProject.modelFilepath)
         result = generateModelDiagnostics(
             descriptor,
-            weights_path=getattr(CurrentProject, "weightsFilepath", ""),
+            weights_path=(
+                getattr(CurrentProject, "weightsFilepath", "")
+                or CurrentProject.modelFilepath
+            ),
             export_name=body.get("exportName", "model_diagnostics.onnx"),
             report_name=body.get("reportName", "model_diagnostics_report.json"),
             mode=body.get("mode", "dummy"),

@@ -104,15 +104,23 @@ class DynamicGraphModule(nn.Module):
                 if execution_op == "recurrent_lstm":
                     out, hidden = mod(in_tensor)
                     hidden_states[node_id] = hidden
-                    if out.dim() == 3 and not self._downstream_expects_sequence(node_id):
-                        outputs[node_id] = out[:, -1, :]
+                    output_mode = (getattr(node_def, "execution", {}) or {}).get("output_mode", "auto")
+                    if out.dim() == 3 and (
+                        output_mode == "last_timestep"
+                        or (output_mode == "auto" and not self._downstream_expects_sequence(node_id))
+                    ):
+                        outputs[node_id] = out[:, -1, :] if getattr(mod, "batch_first", False) else out[-1, :, :]
                     else:
                         outputs[node_id] = out
                 elif execution_op == "recurrent_gru":
                     out, hidden = mod(in_tensor)
                     hidden_states[node_id] = hidden
-                    if out.dim() == 3 and not self._downstream_expects_sequence(node_id):
-                        outputs[node_id] = out[:, -1, :]
+                    output_mode = (getattr(node_def, "execution", {}) or {}).get("output_mode", "auto")
+                    if out.dim() == 3 and (
+                        output_mode == "last_timestep"
+                        or (output_mode == "auto" and not self._downstream_expects_sequence(node_id))
+                    ):
+                        outputs[node_id] = out[:, -1, :] if getattr(mod, "batch_first", False) else out[-1, :, :]
                     else:
                         outputs[node_id] = out
                 else:
