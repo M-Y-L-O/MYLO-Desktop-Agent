@@ -217,19 +217,28 @@ async def save_uploaded_to_slot(file: UploadFile, previous_filename: str = ""):
 
 def loadProjectData():
     global CurrentProject
-    if not CurrentProject.id and os.path.exists(project_path("projectInfo.json")):
-        with open(project_path("projectInfo.json")) as f:
-            data = json.load(f)
-            CurrentProject.name = data.get("name", "")
-            CurrentProject.id = data.get("id", "")
-            CurrentProject.csvFilepath = data.get("csvFilepath", "")
-            CurrentProject.modelFilepath = data.get("modelFilepath", "")
-            CurrentProject.uploadedPt2Filepath = data.get("uploadedPt2Filepath", CurrentProject.modelFilepath or "")
-            CurrentProject.uploadedOnnxFilepath = data.get("uploadedOnnxFilepath", "")
-            CurrentProject.optimizedPt2Filepath = data.get("optimizedPt2Filepath", "")
-            CurrentProject.optimizedOnnxFilepath = data.get("optimizedOnnxFilepath", "")
-            if "weightsFilepath" in data:
-                CurrentProject.weightsFilepath = data.get("weightsFilepath")
+    info_path = project_path("projectInfo.json")
+    if not os.path.exists(info_path):
+        return
+
+    # First boot, or recorded PT2 path is stale/missing (e.g. file renamed on disk).
+    recorded_pt2 = CurrentProject.uploadedPt2Filepath or CurrentProject.modelFilepath
+    needs_reload = (not CurrentProject.id) or (bool(recorded_pt2) and not slot_exists(recorded_pt2))
+    if not needs_reload:
+        return
+
+    with open(info_path) as f:
+        data = json.load(f)
+        CurrentProject.name = data.get("name", "")
+        CurrentProject.id = data.get("id", "")
+        CurrentProject.csvFilepath = data.get("csvFilepath", "")
+        CurrentProject.modelFilepath = data.get("modelFilepath", "")
+        CurrentProject.uploadedPt2Filepath = data.get("uploadedPt2Filepath", CurrentProject.modelFilepath or "")
+        CurrentProject.uploadedOnnxFilepath = data.get("uploadedOnnxFilepath", "")
+        CurrentProject.optimizedPt2Filepath = data.get("optimizedPt2Filepath", "")
+        CurrentProject.optimizedOnnxFilepath = data.get("optimizedOnnxFilepath", "")
+        if "weightsFilepath" in data:
+            CurrentProject.weightsFilepath = data.get("weightsFilepath")
 
 
 def load_optimization_report():
@@ -451,13 +460,7 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
         # New model upload starts a fresh edit history
         _ProjectHistory.clear_project()
 
-        if isinstance(result, dict) and "error" in result:
-            rollback_upload()
-            return JSONResponse(result, 400)
-
-        CurrentProject.dumpInTemp()
-
-        with open(project_path("modelInfo.json"), "w", encoding="utf-8") as f:
+        with open(project_path("modelInfo.json"), "w") as f:
             json.dump(result, f)
 
         if previous_slot_filename and previous_slot_filename != model_name:
