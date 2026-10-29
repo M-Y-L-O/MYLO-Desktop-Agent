@@ -410,6 +410,22 @@ def extractStateDict(model_bytes, is_pytorch: bool):
 
     temp_in = createTempFile(model_bytes, ".pt")
     try:
+        try:
+            from Processing.Models.TorchPackageProcessing import extract_packaged_state_dict
+            packaged_state = extract_packaged_state_dict(temp_in)
+            if packaged_state:
+                return packaged_state
+        except Exception as exc:
+            logging.debug(f"Input is not a loadable torch.package archive: {exc}")
+
+        try:
+            from Processing.Models.TorchExportProcessing import extract_exported_state_dict
+            exported_state = extract_exported_state_dict(temp_in)
+            if exported_state:
+                return exported_state
+        except Exception as exc:
+            logging.debug(f"Input is not a loadable torch.export artifact: {exc}")
+
         checkpoint = torch.load(temp_in, map_location="cpu", weights_only=False)
         if isinstance(checkpoint, dict):
             if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):

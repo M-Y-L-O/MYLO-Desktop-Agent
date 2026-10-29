@@ -97,17 +97,8 @@ class WeightCompatibilityEngine:
         if len(src_tensor.shape) != len(tgt_tensor.shape):
             return None
 
-        # Check shapes
-        for s, t in zip(src_tensor.shape, tgt_tensor.shape):
-            if s > t:
-                # Source is larger than target
-                return None
-
-        # Clone target
         tgt = tgt_tensor.clone()
-
-        
-        slices = tuple(slice(0, s) for s in src_tensor.shape)
-        tgt[slices] = src_tensor
+        common_slices = tuple(slice(0, min(s, t)) for s, t in zip(src_tensor.shape, tgt_tensor.shape))
+        tgt[common_slices] = src_tensor[common_slices]
 
         return tgt
