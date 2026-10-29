@@ -166,14 +166,61 @@ class ArchitectureDescriptor:
                         f"Output shape mismatch: propagated {final_shape}, expected {self.output_shape}"
                     )
 
-    def _propagate_shapes(self, mutate: bool, strict: bool = True) -> Dict[str, List[int]]:
+    def collect_shape_warnings(self) -> List[str]:
+        """Return soft shape issues without failing structural validation.
+
+        Used by the editor to surface problems like output dim mismatches while
+        still allowing the descriptor to be edited.
+        """
+        warnings: List[str] = []
+        try:
+            shapes = self._propagate_shapes(mutate=False, strict=False, warnings=warnings)
+        except Exception as exc:
+            warnings.append(str(exc))
+            return warnings
+
+        output_sources = [edge.source for edge in self.edges if edge.target == "output"]
+        if output_sources:
+            final_shape = shapes.get(output_sources[0])
+            if final_shape and not self._shapes_compatible(final_shape, self.output_shape):
+                warnings.append(
+                    f"Output shape mismatch: propagated {list(final_shape)}, expected {list(self.output_shape)}"
+                )
+        elif any(edge.target == "output" for edge in self.edges) is False and self.nodes:
+            # Reachable graph with no edge into output is a separate connectivity concern;
+            # only warn here when shapes are otherwise computable.
+            pass
+
+        # De-dupe while preserving order
+        seen: Set[str] = set()
+        unique: List[str] = []
+        for warning in warnings:
+            if warning not in seen:
+                seen.add(warning)
+                unique.append(warning)
+        return unique
+
+    def _propagate_shapes(
+        self,
+        mutate: bool,
+        strict: bool = True,
+        warnings: Optional[List[str]] = None,
+    ) -> Dict[str, List[int]]:
         shapes: Dict[str, List[int]] = {"input": list(self.input_shape)}
         try:
             sorted_nodes = self._topological_node_order()
         except Exception as e:
             if strict:
                 raise e
+            if warnings is not None:
+                warnings.append(str(e))
             return shapes
+
+        def _note(message: str) -> None:
+            if strict:
+                raise ValueError(message)
+            if warnings is not None:
+                warnings.append(message)
 
         for node_id in sorted_nodes:
             node = next(n for n in self.nodes if n.id == node_id)
@@ -182,35 +229,35 @@ class ArchitectureDescriptor:
                 continue
 
             try:
-                in_shape = input_shapes[0] if len(input_shapes) == 1 else self._merge_shapes(input_shapes, node, strict=strict)
+                in_shape = (
+                    input_shapes[0]
+                    if len(input_shapes) == 1
+                    else self._merge_shapes(input_shapes, node, strict=strict, warnings=warnings)
+                )
                 in_features = self._infer_in_features(node, in_shape)
 
                 if node.type == "Linear":
                     expected = node.params.get("in_features")
                     if expected is not None and expected != in_features and not mutate:
-                        if strict:
-                            raise ValueError(f"Linear node {node.id} expects in_features={expected}, got {in_features}")
+                        _note(f"Linear node {node.id} expects in_features={expected}, got {in_features}")
                     if mutate:
                         node.params["in_features"] = in_features
                 elif node.type in ("Conv1d", "Conv2d"):
                     expected = node.params.get("in_channels")
                     if expected is not None and expected != in_features and not mutate:
-                        if strict:
-                            raise ValueError(f"{node.type} node {node.id} expects in_channels={expected}, got {in_features}")
+                        _note(f"{node.type} node {node.id} expects in_channels={expected}, got {in_features}")
                     if mutate:
                         node.params["in_channels"] = in_features
                 elif node.type in ("LSTM", "GRU"):
                     expected = node.params.get("input_size")
                     if expected is not None and expected != in_features and not mutate:
-                        if strict:
-                            raise ValueError(f"{node.type} node {node.id} expects input_size={expected}, got {in_features}")
+                        _note(f"{node.type} node {node.id} expects input_size={expected}, got {in_features}")
                     if mutate:
                         node.params["input_size"] = in_features
                 elif node.type in ("BatchNorm1d", "BatchNorm2d"):
                     expected = node.params.get("num_features")
                     if expected is not None and expected != in_features and not mutate:
-                        if strict:
-                            raise ValueError(f"{node.type} node {node.id} expects num_features={expected}, got {in_features}")
+                        _note(f"{node.type} node {node.id} expects num_features={expected}, got {in_features}")
                     if mutate:
                         node.params["num_features"] = in_features
 
@@ -219,6 +266,10 @@ class ArchitectureDescriptor:
             except Exception as e:
                 if strict:
                     raise e
+                if warnings is not None:
+                    message = str(e)
+                    if message not in warnings:
+                        warnings.append(message)
                 if input_shapes:
                     shapes[node_id] = input_shapes[0]
 
@@ -266,7 +317,19 @@ class ArchitectureDescriptor:
                 collected.append(shapes[edge.source])
         return collected
 
-    def _merge_shapes(self, input_shapes: List[List[int]], node: Node, strict: bool = True) -> List[int]:
+    def _merge_shapes(
+        self,
+        input_shapes: List[List[int]],
+        node: Node,
+        strict: bool = True,
+        warnings: Optional[List[str]] = None,
+    ) -> List[int]:
+        def _note(message: str) -> None:
+            if strict:
+                raise ValueError(message)
+            if warnings is not None:
+                warnings.append(message)
+
         if len(input_shapes) <= 1:
             return input_shapes[0]
 
@@ -274,8 +337,7 @@ class ArchitectureDescriptor:
             reference = input_shapes[0]
             for candidate in input_shapes[1:]:
                 if not self._shapes_compatible(candidate, reference):
-                    if strict:
-                        raise ValueError(f"Add node {node.id} requires compatible input shapes")
+                    _note(f"Add node {node.id} requires compatible input shapes")
             return list(reference)
 
         if node.type == "Concat":
@@ -283,23 +345,20 @@ class ArchitectureDescriptor:
             rank = len(input_shapes[0])
             concat_dim = concat_dim if concat_dim >= 0 else rank + concat_dim
             if concat_dim < 0 or concat_dim >= rank:
-                if strict:
-                    raise ValueError(f"Concat node {node.id} has invalid dim {node.params.get('dim', -1)}")
+                _note(f"Concat node {node.id} has invalid dim {node.params.get('dim', -1)}")
                 return list(input_shapes[0])
 
             reference = list(input_shapes[0])
             total = reference[concat_dim]
             for candidate in input_shapes[1:]:
                 if len(candidate) != rank:
-                    if strict:
-                        raise ValueError(f"Concat node {node.id} requires matching ranks")
+                    _note(f"Concat node {node.id} requires matching ranks")
                     continue
                 for index, (ref_dim, cand_dim) in enumerate(zip(reference, candidate)):
                     if index == concat_dim:
                         continue
                     if ref_dim != -1 and cand_dim != -1 and ref_dim != cand_dim:
-                        if strict:
-                            raise ValueError(f"Concat node {node.id} requires matching non-concat dimensions")
+                        _note(f"Concat node {node.id} requires matching non-concat dimensions")
                 if total == -1 or candidate[concat_dim] == -1:
                     total = -1
                 else:
@@ -309,8 +368,7 @@ class ArchitectureDescriptor:
             output[concat_dim] = total
             return output
 
-        if strict:
-            raise ValueError(f"Node {node.id} received multiple inputs but type {node.type} is not an explicit merge op")
+        _note(f"Node {node.id} received multiple inputs but type {node.type} is not an explicit merge op")
         return list(input_shapes[0])
 
     def _infer_output_shape(self, node: Node, in_shape: List[int]) -> List[int]:

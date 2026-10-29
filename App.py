@@ -29,6 +29,7 @@ from Processing.Models.ModelEditing import (
     undoModelEdit,
     redoModelEdit,
     exportUploadedPt2ToOnnx,
+    log_blocked,
     _ProjectHistory,
     _get_draft_node_ids,
     _get_reachable_nodes,
@@ -55,7 +56,9 @@ CurrentProject = ProjectData()
 queue = []
 optimizing = False
 
-MIDDLEWARE_EXCEPTIONS = ["/", "/initialize", "/docs", "/openapi.json", "/optimizationStatus"]
+# EventSource cannot send Authorization headers, so SSE must be exempt.
+# /disconnect is exempt so a browser with a stale/missing key can reset the session.
+MIDDLEWARE_EXCEPTIONS = ["/", "/initialize", "/optimizationStatus", "/disconnect"]
 
 REPORT_FILENAME = "optimization_report.json"
 
@@ -63,17 +66,40 @@ REPORT_FILENAME = "optimization_report.json"
 
 load_dotenv()
 
+_enable_docs = os.getenv("ENABLE_AGENT_DOCS", "").strip().lower() in ("1", "true", "yes")
 
-
-app = FastAPI(title="MYLO AGENT", version="0.2.2")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="MYLO AGENT",
+    version="0.2.2",
+    docs_url="/docs" if _enable_docs else None,
+    redoc_url="/redoc" if _enable_docs else None,
+    openapi_url="/openapi.json" if _enable_docs else None,
 )
+
+def _cors_origins() -> list[str]:
+    """Browser origins allowed to call this loopback agent.
+
+    LOCAL mode talks from the page origin directly to 127.0.0.1, so a deployed
+    web UI (e.g. Vercel) must be listed here or CORS preflight fails.
+    Override with CORS_ORIGINS=https://app.example.com,http://localhost:3000
+    """
+    raw = os.getenv("CORS_ORIGINS", "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://mylo-web-deployument.vercel.app",
+    ]
+
+
+@app.middleware("http")
+async def allow_private_network(request: Request, call_next):
+    """Chrome Private Network Access: public HTTPS pages → loopback agent."""
+    response = await call_next(request)
+    if request.headers.get("access-control-request-private-network") == "true":
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
 
 
 
@@ -81,6 +107,32 @@ app.add_middleware(
 
 def project_path(filename: str) -> str:
     return os.path.join("temp_project", filename)
+
+
+def _client_is_loopback(request: Request) -> bool:
+    host = (request.client.host if request.client else "") or ""
+    return host in ("127.0.0.1", "::1", "localhost", "testclient")
+
+
+def safe_extract_zip(zip_ref: ZipFile, dest_dir: str) -> None:
+    """Extract zip members only if every path stays under dest_dir (Zip Slip safe)."""
+    dest_dir = os.path.abspath(dest_dir)
+    os.makedirs(dest_dir, exist_ok=True)
+    for member in zip_ref.infolist():
+        name = member.filename
+        if not name or name.endswith("/"):
+            continue
+        # Reject absolute / drive-letter / backslash traversal variants
+        if os.path.isabs(name) or name.startswith(("/", "\\")) or ":" in name.split("/")[0]:
+            raise ValueError(f"Illegal zip entry path: {name}")
+        target = os.path.abspath(os.path.join(dest_dir, name))
+        try:
+            common = os.path.commonpath([dest_dir, target])
+        except ValueError as exc:
+            raise ValueError(f"Illegal zip entry path: {name}") from exc
+        if common != dest_dir:
+            raise ValueError(f"Illegal zip entry path: {name}")
+    zip_ref.extractall(dest_dir)
 
 
 def slot_path(filename: str) -> str:
@@ -220,6 +272,17 @@ async def checkRequest(request: Request, call_next):
     return await call_next(request)
 
 
+# Register CORS last so it is outermost: early auth responses still get ACAO headers.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 # ---------------- SESSION ----------------
 
 @app.get("/")
@@ -244,6 +307,14 @@ async def initialize(request: Request):
 
     if not apiKey:
         return JSONResponse({"error": "API key required"}, 400)
+
+    bootstrap = os.getenv("AGENT_BOOTSTRAP_TOKEN", "").strip()
+    if bootstrap:
+        provided = request.headers.get("X-Bootstrap-Token") or data.get("bootstrapToken")
+        if provided != bootstrap:
+            return JSONResponse({"error": "Invalid bootstrap token"}, 401)
+    elif not _client_is_loopback(request):
+        return JSONResponse({"error": "Initialize only allowed from localhost"}, 403)
 
     CurrentSession = SessionData()
     CurrentSession.apiKey = apiKey
@@ -296,6 +367,9 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
 
         if isinstance(result, dict) and "error" in result:
             raise ValueError(result["error"])
+
+        # New model upload starts a fresh edit history
+        _ProjectHistory.clear_project()
 
         with open(project_path("modelInfo.json"), "w") as f:
             json.dump(result, f)
@@ -423,6 +497,7 @@ async def getModelDescriptor():
         descriptor = loadProjectDescriptor()
         return JSONResponse({"descriptor": descriptor.to_dict()})
     except Exception as e:
+        log_blocked("getModelDescriptor", str(e), code="LOAD_FAILED")
         return JSONResponse({"error": str(e)}, 400)
 
 
@@ -438,9 +513,11 @@ async def validateModelDescriptor(request: Request):
         descriptor_dict = body.get("descriptor")
         strict = bool(body.get("strict", False))
         if not descriptor_dict:
+            log_blocked("validate", "descriptor is required", code="MISSING_ARGUMENT")
             return JSONResponse({"error": "descriptor is required"}, 400)
         return JSONResponse(validateDescriptorPayload(descriptor_dict, strict=strict))
     except Exception as e:
+        log_blocked("validate", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -453,6 +530,13 @@ def _handle_edit_request(body: dict, persist: bool, dry_run: bool) -> JSONRespon
     operation = body.get("operation")
     payload = body.get("payload", {})
     if not operation:
+        log_blocked(
+            "previewEdit" if dry_run else "editModel",
+            "operation is required",
+            code="MISSING_ARGUMENT",
+            persist=persist,
+            dry_run=dry_run,
+        )
         return JSONResponse({"error": "operation is required"}, 400)
 
     result = applyModelEdit(
@@ -479,6 +563,7 @@ async def editModel(request: Request):
         body = await request.json()
         return _handle_edit_request(body, persist=bool(body.get("persist", False)), dry_run=False)
     except Exception as e:
+        log_blocked("editModel", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -489,6 +574,7 @@ async def previewEdit(request: Request):
         body = await request.json()
         return _handle_edit_request(body, persist=False, dry_run=True)
     except Exception as e:
+        log_blocked("previewEdit", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -503,6 +589,14 @@ async def checkEdge(request: Request):
         target_port = body.get("targetPort", body.get("target_port", "input"))
 
         if not descriptor_dict or not source or not target:
+            log_blocked(
+                "checkEdge",
+                "descriptor, source, and target are required",
+                code="MISSING_ARGUMENT",
+                hasDescriptor=bool(descriptor_dict),
+                source=source,
+                target=target,
+            )
             return JSONResponse({"error": "descriptor, source, and target are required"}, 400)
 
         result = checkEdgeCompatibility(
@@ -515,6 +609,7 @@ async def checkEdge(request: Request):
         status = 200 if result.get("compatible") else 400
         return JSONResponse(result, status)
     except Exception as e:
+        log_blocked("checkEdge", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -525,6 +620,7 @@ async def saveModelDescriptorEndpoint(request: Request):
         body = await request.json()
         descriptor_dict = body.get("descriptor")
         if not descriptor_dict:
+            log_blocked("save", "descriptor is required", code="MISSING_ARGUMENT")
             return JSONResponse({"error": "descriptor is required"}, 400)
 
         result = saveModelDescriptor(
@@ -535,6 +631,7 @@ async def saveModelDescriptorEndpoint(request: Request):
         status = 200 if result.get("success") or result.get("valid") else 400
         return JSONResponse(result, status)
     except Exception as e:
+        log_blocked("save", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -545,6 +642,7 @@ async def compileModelDescriptor(request: Request):
         body = await request.json()
         descriptor_dict = body.get("descriptor")
         if not descriptor_dict:
+            log_blocked("compile", "descriptor is required", code="MISSING_ARGUMENT")
             return JSONResponse({"error": "descriptor is required"}, 400)
 
         from Core.ArchitectureDescriptor import ArchitectureDescriptor
@@ -554,11 +652,13 @@ async def compileModelDescriptor(request: Request):
         draft_ids = _get_draft_node_ids(descriptor)
 
         if draft_ids:
+            reason = f"Cannot compile: {len(draft_ids)} disconnected node(s) found"
+            log_blocked("compile", reason, code="DRAFT_NODES_EXIST", draftNodes=sorted(draft_ids))
             return JSONResponse({
                 "valid": False,
                 "strict": True,
                 "code": "DRAFT_NODES_EXIST",
-                "message": f"Cannot compile: {len(draft_ids)} disconnected node(s) found",
+                "message": reason,
                 "draftNodes": sorted(draft_ids),
                 "error": "All nodes must be connected to an Input before compiling. "
                          "Connect draft nodes or remove them.",
@@ -576,6 +676,7 @@ async def compileModelDescriptor(request: Request):
                 "message": "Descriptor is valid for compilation",
             })
         except Exception as exc:
+            log_blocked("compile", str(exc), code="VALIDATION_ERROR")
             return JSONResponse({
                 "valid": False,
                 "strict": True,
@@ -585,6 +686,7 @@ async def compileModelDescriptor(request: Request):
             }, 400)
 
     except Exception as e:
+        log_blocked("compile", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -601,6 +703,7 @@ async def visualizeModelEndpoint(request: Request):
             return JSONResponse(result, 400)
         return JSONResponse(result)
     except Exception as e:
+        log_blocked("visualize", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -611,6 +714,7 @@ async def expandModelNodes(request: Request):
         body = await request.json()
         node_ids = body.get("nodeIds") or body.get("node_ids") or []
         if not node_ids:
+            log_blocked("expandNodes", "nodeIds is required", code="MISSING_ARGUMENT")
             return JSONResponse({"error": "nodeIds is required"}, 400)
 
         result = expandNodes(
@@ -622,6 +726,7 @@ async def expandModelNodes(request: Request):
             return JSONResponse(result, 400)
         return JSONResponse(result)
     except Exception as e:
+        log_blocked("expandNodes", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -632,6 +737,7 @@ async def collapseModelNodes(request: Request):
         body = await request.json()
         node_ids = body.get("nodeIds") or body.get("node_ids") or []
         if not node_ids:
+            log_blocked("collapseNodes", "nodeIds is required", code="MISSING_ARGUMENT")
             return JSONResponse({"error": "nodeIds is required"}, 400)
 
         result = collapseNodes(
@@ -643,6 +749,7 @@ async def collapseModelNodes(request: Request):
             return JSONResponse(result, 400)
         return JSONResponse(result)
     except Exception as e:
+        log_blocked("collapseNodes", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -670,6 +777,7 @@ async def editor_undo(request: Request):
         status = 200 if result.get("success") else 400
         return JSONResponse(result, status)
     except Exception as e:
+        log_blocked("undo", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -685,6 +793,7 @@ async def editor_redo(request: Request):
         status = 200 if result.get("success") else 400
         return JSONResponse(result, status)
     except Exception as e:
+        log_blocked("redo", str(e), code="UNKNOWN_ERROR")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -900,16 +1009,33 @@ async def optimizeModel(request: Request):
     elif isinstance(result, dict) and "error" in result:
         queue.append({"type": "error", "status": f"Optimization failed: {result.get('error')}", "error": True, "progress": 0})
 
-    return JSONResponse({"status_updates": queue, "result": result})
+    return JSONResponse({
+        "status_updates": queue,
+        "result": make_json_serializable(result),
+    })
 
 
 @app.get("/optimizationStatus")
 async def optimizationStatus(request: Request):
+    """SSE progress feed.
+
+    The UI opens EventSource *before* POST /optimizeModel, so this must always
+    return text/event-stream and briefly wait for optimizing=True.
+    """
     global queue, optimizing
-    if not optimizing:
-        return JSONResponse({"status": "No optimization in progress"})
 
     async def statusGenerator():
+        waited = 0.0
+        while not optimizing and waited < 15.0:
+            if await request.is_disconnected():
+                return
+            await asyncio.sleep(0.1)
+            waited += 0.1
+
+        if not optimizing:
+            yield f"data: {json.dumps({'type': 'idle', 'status': 'No optimization in progress', 'progress': 0})}\n\n"
+            return
+
         while True:
             if await request.is_disconnected():
                 break
@@ -1064,7 +1190,7 @@ async def loadProject(file: UploadFile = File(...)):
         temp_path = await saveFile(file, path="temp_export")
 
         with ZipFile(temp_path, 'r') as zip_ref:
-            zip_ref.extractall("temp_project")
+            safe_extract_zip(zip_ref, "temp_project")
 
         os.remove(temp_path)
 

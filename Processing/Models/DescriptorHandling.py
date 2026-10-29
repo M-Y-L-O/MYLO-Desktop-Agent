@@ -330,7 +330,14 @@ def saveDescriptorToProject(descriptor) -> None:
         json.dump(descriptor.to_dict(), f, indent=2)
 
 
-def loadDescriptorFromBytes(model_bytes, is_pytorch: bool, input_dim: int, output_dim: int):
+def loadDescriptorFromBytes(
+    model_bytes,
+    is_pytorch: bool,
+    input_dim: int,
+    output_dim: int,
+    *,
+    fallback_default: bool = True,
+):
     from Core.ArchitectureDescriptor import ArchitectureDescriptor
 
     try:
@@ -360,12 +367,45 @@ def loadDescriptorFromBytes(model_bytes, is_pytorch: bool, input_dim: int, outpu
             if os.path.exists(temp_in):
                 os.remove(temp_in)
 
+    if not fallback_default:
+        raise ValueError(
+            "Could not extract an architecture descriptor from the model file. "
+            "Expected a JSON .pt2 with 'nodes', or a checkpoint containing "
+            "model_config/descriptor/architecture."
+        )
+
     descriptor = ArchitectureDescriptor.default_feedforward(input_dim, output_dim)
     descriptor.validate()
     return descriptor
 
 def extractStateDict(model_bytes, is_pytorch: bool):
-    if not is_pytorch:
+    if not is_pytorch or not model_bytes:
+        return None
+
+    # Editor-created .pt2 files are plain JSON architecture (no weights).
+    # torch.load on those fails with: invalid load key, '{'.
+    if model_bytes.lstrip()[:1] == b"{":
+        try:
+            payload = json.loads(model_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            logging.warning(
+                "Model file starts with '{' but is not valid JSON; "
+                "cannot extract weights (%s)",
+                exc,
+            )
+            return None
+
+        if isinstance(payload, dict) and "nodes" in payload:
+            logging.info(
+                "Model file is a JSON architecture descriptor without weights; "
+                "training will start from random initialization."
+            )
+            return None
+
+        logging.warning(
+            "Model file starts with '{' but is not an architecture descriptor "
+            "(missing 'nodes'); cannot extract weights."
+        )
         return None
 
     temp_in = createTempFile(model_bytes, ".pt")

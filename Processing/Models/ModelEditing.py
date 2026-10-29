@@ -25,6 +25,50 @@ logger = logging.getLogger(__name__)
 DESCRIPTOR_FILENAME = "descriptor.json"
 MODEL_INFO_FILENAME = "modelInfo.json"
 
+
+# ---------------------------------------------------------------------------
+# Blocked-action reasons (Python console + future user-facing details)
+# ---------------------------------------------------------------------------
+
+def log_blocked(
+    action: str,
+    reason: str,
+    *,
+    code: Optional[str] = None,
+    **details: Any,
+) -> None:
+    """Print why an editor action cannot complete (agent console + logger).
+
+    ``reason`` / ``code`` / ``details`` are structured so the same payload can
+    later drive UI toasts without rewriting call sites.
+    """
+    code_s = f" [{code}]" if code else ""
+    detail_s = f" | {details}" if details else ""
+    msg = f'[ModelEditor] blocked "{action}"{code_s}: {reason}{detail_s}'
+    print(msg, flush=True)
+    logger.warning("%s", msg)
+
+
+def blocked_edit_result(
+    action: str,
+    code: str,
+    message: str,
+    field: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Log a block and return the standard ``{success: False, error: {...}}`` shape."""
+    details = details or {}
+    log_blocked(action, message, code=code, field=field, **details)
+    return {
+        "success": False,
+        "error": {
+            "code": code,
+            "message": message,
+            "field": field,
+            "details": details,
+        },
+    }
+
 # ---------------------------------------------------------------------------
 # Project-scoped undo/redo history
 # ---------------------------------------------------------------------------
@@ -45,13 +89,14 @@ class _ProjectHistory:
             cls._stacks[key] = {"undo": [], "redo": []}
 
     @classmethod
-    def push_undo(cls, descriptor_dict: Dict[str, Any]) -> None:
+    def push_undo(cls, descriptor_dict: Dict[str, Any], *, clear_redo: bool = True) -> None:
         key = cls._key()
         cls._ensure(key)
         cls._stacks[key]["undo"].append(copy.deepcopy(descriptor_dict))
         if len(cls._stacks[key]["undo"]) > cls._MAX_HISTORY:
             cls._stacks[key]["undo"].pop(0)
-        cls._stacks[key]["redo"].clear()
+        if clear_redo:
+            cls._stacks[key]["redo"].clear()
 
     @classmethod
     def pop_undo(cls) -> Optional[Dict[str, Any]]:
@@ -86,6 +131,10 @@ class _ProjectHistory:
         key = cls._key()
         cls._ensure(key)
         return bool(cls._stacks[key]["redo"])
+
+    @classmethod
+    def status(cls) -> Dict[str, bool]:
+        return {"canUndo": cls.can_undo(), "canRedo": cls.can_redo()}
 
     @classmethod
     def clear_project(cls, key: Optional[str] = None) -> None:
@@ -135,31 +184,57 @@ def loadProjectDescriptor(model_filepath: str = "") -> ArchitectureDescriptor:
     return descriptor
 
 
-def saveProjectDescriptor(descriptor: ArchitectureDescriptor) -> None:
-    """Save descriptor to disk. Undo snapshot is taken *after* validation."""
+def saveProjectDescriptor(
+    descriptor: ArchitectureDescriptor,
+    *,
+    record_undo: bool = False,
+    strict: bool = True,
+) -> None:
+    """Save descriptor to disk.
+
+    ``record_undo`` is opt-in. Edit operations push the pre-edit descriptor
+    themselves; an explicit Save should not invent a fake history entry from
+    the post-write file (that previously made undo jump back to older saves).
+
+    ``strict`` controls validation: canvas edits may write draft/disconnected
+    graphs, while Save / persist paths should fail closed.
+    """
     descriptor_path = project_path(DESCRIPTOR_FILENAME)
     os.makedirs("temp_project", exist_ok=True)
 
-    # Strict validation before persisting — no draft nodes allowed at save time
-    descriptor.validate()
+    try:
+        descriptor.validate()
+    except Exception as exc:
+        if strict:
+            raise
+        logger.warning("Saving draft descriptor with validation errors: %s", exc)
 
-    # Save the new descriptor
-    with open(descriptor_path, "w", encoding="utf-8") as f:
-        json.dump(descriptor.to_dict(), f, indent=2)
-
-    # Push previous state to undo (if there was one)
-    if os.path.exists(descriptor_path):
+    previous_dict: Optional[Dict[str, Any]] = None
+    if record_undo and os.path.exists(descriptor_path):
         try:
             with open(descriptor_path, "r", encoding="utf-8") as f:
-                current_dict = json.load(f)
-                _ProjectHistory.push_undo(current_dict)
+                previous_dict = json.load(f)
         except Exception:
-            pass
+            previous_dict = None
+
+    new_dict = descriptor.to_dict()
+    with open(descriptor_path, "w", encoding="utf-8") as f:
+        json.dump(new_dict, f, indent=2)
+
+    if record_undo and previous_dict is not None and previous_dict != new_dict:
+        _ProjectHistory.push_undo(previous_dict)
 
 
 def undoModelEdit(view_mode: str = "summary", expanded_nodes: Optional[List[str]] = None) -> Dict[str, Any]:
     if not _ProjectHistory.can_undo():
-        return {"success": False, "error": {"code": "NO_UNDO_HISTORY", "message": "No actions to undo"}}
+        return {
+            **blocked_edit_result(
+                "undo",
+                "NO_UNDO_HISTORY",
+                "No actions to undo — undo stack is empty",
+            ),
+            **_ProjectHistory.status(),
+        }
 
     descriptor_path = project_path(DESCRIPTOR_FILENAME)
     current_dict = None
@@ -167,12 +242,19 @@ def undoModelEdit(view_mode: str = "summary", expanded_nodes: Optional[List[str]
         try:
             with open(descriptor_path, "r", encoding="utf-8") as f:
                 current_dict = json.load(f)
-        except Exception:
-            pass
+        except Exception as exc:
+            log_blocked("undo", "Could not read current descriptor before undo (continuing)", code="READ_FAILED", error=str(exc))
 
     previous_dict = _ProjectHistory.pop_undo()
     if previous_dict is None:
-        return {"success": False, "error": {"code": "NO_UNDO_HISTORY", "message": "No actions to undo"}}
+        return {
+            **blocked_edit_result(
+                "undo",
+                "NO_UNDO_HISTORY",
+                "No actions to undo — pop_undo returned empty after can_undo was true",
+            ),
+            **_ProjectHistory.status(),
+        }
 
     if current_dict:
         _ProjectHistory.push_redo(current_dict)
@@ -182,7 +264,7 @@ def undoModelEdit(view_mode: str = "summary", expanded_nodes: Optional[List[str]
     with open(descriptor_path, "w", encoding="utf-8") as f:
         json.dump(descriptor.to_dict(), f, indent=2)
 
-    _sync_weights_after_edit(descriptor)
+    _sync_model_file_after_edit(descriptor)
     graph = refreshModelVisualization(descriptor, view_mode=view_mode, expanded_nodes=expanded_nodes or [])
 
     try:
@@ -195,14 +277,23 @@ def undoModelEdit(view_mode: str = "summary", expanded_nodes: Optional[List[str]
         "success": True,
         "descriptor": descriptor.to_dict(),
         "shapes": shapes_dict,
+        "warnings": graph.get("warnings") or _collect_descriptor_warnings(descriptor),
         "graph": graph,
-        "message": "Undo applied successfully"
+        "message": "Undo applied successfully",
+        **_ProjectHistory.status(),
     }
 
 
 def redoModelEdit(view_mode: str = "summary", expanded_nodes: Optional[List[str]] = None) -> Dict[str, Any]:
     if not _ProjectHistory.can_redo():
-        return {"success": False, "error": {"code": "NO_REDO_HISTORY", "message": "No actions to redo"}}
+        return {
+            **blocked_edit_result(
+                "redo",
+                "NO_REDO_HISTORY",
+                "No actions to redo — redo stack is empty",
+            ),
+            **_ProjectHistory.status(),
+        }
 
     descriptor_path = project_path(DESCRIPTOR_FILENAME)
     current_dict = None
@@ -210,22 +301,30 @@ def redoModelEdit(view_mode: str = "summary", expanded_nodes: Optional[List[str]
         try:
             with open(descriptor_path, "r", encoding="utf-8") as f:
                 current_dict = json.load(f)
-        except Exception:
-            pass
+        except Exception as exc:
+            log_blocked("redo", "Could not read current descriptor before redo (continuing)", code="READ_FAILED", error=str(exc))
 
     next_dict = _ProjectHistory.pop_redo()
     if next_dict is None:
-        return {"success": False, "error": {"code": "NO_REDO_HISTORY", "message": "No actions to redo"}}
+        return {
+            **blocked_edit_result(
+                "redo",
+                "NO_REDO_HISTORY",
+                "No actions to redo — pop_redo returned empty after can_redo was true",
+            ),
+            **_ProjectHistory.status(),
+        }
 
+    # Preserve remaining redo entries — push_undo(clear_redo=True) would wipe them.
     if current_dict:
-        _ProjectHistory.push_undo(current_dict)
+        _ProjectHistory.push_undo(current_dict, clear_redo=False)
 
     descriptor = ArchitectureDescriptor.from_dict(next_dict)
     os.makedirs("temp_project", exist_ok=True)
     with open(descriptor_path, "w", encoding="utf-8") as f:
         json.dump(descriptor.to_dict(), f, indent=2)
 
-    _sync_weights_after_edit(descriptor)
+    _sync_model_file_after_edit(descriptor)
     graph = refreshModelVisualization(descriptor, view_mode=view_mode, expanded_nodes=expanded_nodes or [])
 
     try:
@@ -238,8 +337,10 @@ def redoModelEdit(view_mode: str = "summary", expanded_nodes: Optional[List[str]
         "success": True,
         "descriptor": descriptor.to_dict(),
         "shapes": shapes_dict,
+        "warnings": graph.get("warnings") or _collect_descriptor_warnings(descriptor),
         "graph": graph,
-        "message": "Redo applied successfully"
+        "message": "Redo applied successfully",
+        **_ProjectHistory.status(),
     }
 
 
@@ -375,6 +476,18 @@ def _propagate_shapes_with_drafts(
     return all_shapes
 
 
+def _collect_descriptor_warnings(descriptor: ArchitectureDescriptor) -> List[str]:
+    """Soft shape / contract warnings for the editor (never fail the edit)."""
+    draft_ids = _get_draft_node_ids(descriptor)
+    target = _get_active_subgraph(descriptor) if draft_ids else descriptor
+    if not target.nodes and not any(e.target == "output" for e in target.edges):
+        return []
+    try:
+        return target.collect_shape_warnings()
+    except Exception as exc:
+        return [str(exc)]
+
+
 # ---------------------------------------------------------------------------
 # Visualization helpers (defined in this module so they are importable)
 # ---------------------------------------------------------------------------
@@ -398,6 +511,8 @@ def refreshModelVisualization(
     draft_ids = _get_draft_node_ids(descriptor)
     graph["draftNodes"] = sorted(draft_ids)
     graph["activeNodes"] = sorted({n.id for n in descriptor.nodes} - draft_ids)
+    graph["warnings"] = _collect_descriptor_warnings(descriptor)
+    graph["shapes"] = _propagate_shapes_with_drafts(descriptor, strict=False)
 
     # Per-node draft flag for convenience
     if "nodes" in graph:
@@ -419,20 +534,39 @@ def validateDescriptorPayload(descriptor_dict: Dict[str, Any], strict: bool = Fa
 
     By default uses lenient validation (allows draft nodes).
     Pass strict=True for save-time enforcement.
+    Soft shape issues are always returned in ``warnings`` so the editor can
+    show them even when the descriptor is structurally valid.
     """
     try:
         descriptor = ArchitectureDescriptor.from_dict(descriptor_dict)
         descriptor.normalize_inplace(strict=strict)
         _validate_with_drafts(descriptor, strict=strict)
         shapes = _propagate_shapes_with_drafts(descriptor, strict=strict)
-        return {
+        warnings = _collect_descriptor_warnings(descriptor)
+        result = {
             "valid": True,
             "descriptor": descriptor.to_dict(),
             "shapes": shapes,
             "draftNodes": sorted(_get_draft_node_ids(descriptor)),
+            "warnings": warnings,
         }
+        # Strict callers (export/compile) treat shape warnings as hard failures
+        if strict and warnings:
+            result["valid"] = False
+            result["error"] = {
+                "code": "SHAPE_MISMATCH" if any("shape mismatch" in w.lower() for w in warnings) else "VALIDATION_WARNING",
+                "message": warnings[0],
+                "details": {"warnings": warnings},
+            }
+            log_blocked("validate", warnings[0], code=result["error"]["code"], strict=strict)
+        return result
     except Exception as exc:
-        return {"valid": False, "error": str(exc)}
+        log_blocked("validate", str(exc), code="VALIDATION_ERROR", strict=strict)
+        return {
+            "valid": False,
+            "error": {"code": "VALIDATION_ERROR", "message": str(exc)},
+            "warnings": [str(exc)],
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +604,7 @@ class ModelEditEngine:
         "LayerNorm", "BatchNorm1d", "BatchNorm2d", "Flatten",
     ]
     SWAPPABLE_ACTIVATIONS = MutationGrammar.ACTIVATION_TYPES
-    PROTECTED_TYPES = {"LSTM", "GRU", "MultiheadAttention"}
+    PROTECTED_TYPES = {} # "LSTM", "GRU", "MultiheadAttention" - why not allow edits to these? maybe allow edits but warn user
 
     @classmethod
     def apply(cls, descriptor: ArchitectureDescriptor, operation: str, payload: Dict[str, Any], strict: bool = False) -> Dict[str, Any]:
@@ -489,19 +623,27 @@ class ModelEditEngine:
         }.get(operation)
 
         if not handler:
-            return {
-                "success": False,
-                "error": {
-                    "code": "UNKNOWN_OPERATION",
-                    "message": f"Unknown operation: {operation}",
-                    "field": None,
-                    "details": {}
-                }
-            }
+            return blocked_edit_result(
+                operation or "apply",
+                "UNKNOWN_OPERATION",
+                f"Unknown operation: {operation}",
+                details={"payloadKeys": list(payload.keys()) if isinstance(payload, dict) else []},
+            )
 
         try:
             result = handler(working, payload)
             if not result.get("success"):
+                err = result.get("error") or {}
+                if isinstance(err, dict):
+                    log_blocked(
+                        operation,
+                        err.get("message") or "Handler returned success=False",
+                        code=err.get("code"),
+                        field=err.get("field"),
+                        **(err.get("details") or {}),
+                    )
+                else:
+                    log_blocked(operation, str(err) or "Handler returned success=False")
                 return result
 
             try:
@@ -524,26 +666,26 @@ class ModelEditEngine:
 
             shapes = _propagate_shapes_with_drafts(working, strict=strict)
             draft_ids = _get_draft_node_ids(working)
+            warnings = _collect_descriptor_warnings(working)
 
             return {
                 "success": True,
                 "descriptor": working.to_dict(),
                 "shapes": shapes,
+                "warnings": warnings,
                 "message": result.get("message", f"Applied {operation}"),
                 "affected": result.get("affected", {}),
                 "draftNodes": sorted(draft_ids),
                 "activeNodes": sorted({n.id for n in working.nodes} - draft_ids),
             }
         except EditError as exc:
-            return {
-                "success": False,
-                "error": {
-                    "code": exc.code,
-                    "message": exc.message,
-                    "field": exc.field,
-                    "details": exc.details
-                }
-            }
+            return blocked_edit_result(
+                operation,
+                exc.code,
+                exc.message,
+                field=exc.field,
+                details=exc.details,
+            )
         except ValueError as exc:
             msg = str(exc)
             code = "VALIDATION_ERROR"
@@ -563,26 +705,15 @@ class ModelEditEngine:
                 code = "INCOMPATIBLE_SHAPES"
             elif "concat dimension" in msg:
                 code = "INCOMPATIBLE_SHAPES"
-            return {
-                "success": False,
-                "error": {
-                    "code": code,
-                    "message": msg,
-                    "field": field,
-                    "details": {}
-                }
-            }
+            return blocked_edit_result(operation, code, msg, field=field)
         except Exception as exc:
             logger.exception("Model edit failed: %s", operation)
-            return {
-                "success": False,
-                "error": {
-                    "code": "UNKNOWN_ERROR",
-                    "message": str(exc),
-                    "field": None,
-                    "details": {}
-                }
-            }
+            return blocked_edit_result(
+                operation,
+                "UNKNOWN_ERROR",
+                str(exc),
+                details={"exceptionType": type(exc).__name__},
+            )
 
     @classmethod
     def _add_node(cls, descriptor: ArchitectureDescriptor, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -633,6 +764,14 @@ class ModelEditEngine:
 
         if not node_id:
             raise EditError("MISSING_ARGUMENT", "nodeId is required", field="nodeId")
+
+        if node_id in ("input", "output"):
+            raise EditError(
+                "PROTECTED_NODE",
+                f"Cannot remove protected node: {node_id}",
+                field="nodeId",
+                details={"nodeId": node_id},
+            )
 
         if not any(n.id == node_id for n in descriptor.nodes):
             raise EditError("NODE_NOT_FOUND", f"Node not found: {node_id}", field="nodeId", details={"nodeId": node_id})
@@ -744,7 +883,11 @@ class ModelEditEngine:
         before = len(descriptor.edges)
         descriptor.edges = [e for e in descriptor.edges if not (e.source == source and e.target == target)]
         if len(descriptor.edges) == before:
-            raise EditError("EDGE_NOT_FOUND", "Edge not found", details={"source": source, "target": target})
+            return {
+                "success": True,
+                "affected": {"source": source, "target": target},
+                "message": "Edge already absent",
+            }
 
         return {"success": True, "affected": {"source": source, "target": target}, "message": "Edge removed"}
 
@@ -861,24 +1004,50 @@ def applyModelEdit(
     else:
         descriptor = loadProjectDescriptor()
 
+    # Snapshot pre-edit state for session undo (previews must not pollute history)
+    before_dict = descriptor.to_dict()
+
     # Use strict validation only when actually persisting to disk
     strict = persist
 
     edit_result = ModelEditEngine.apply(descriptor, operation, payload, strict=strict)
     if not edit_result.get("success"):
-        return edit_result
+        # ModelEditEngine.apply already logs; note dry_run/persist context for the console
+        err = (edit_result.get("error") or {}) if isinstance(edit_result.get("error"), dict) else {}
+        log_blocked(
+            "applyModelEdit",
+            err.get("message") or "Edit rejected",
+            code=err.get("code"),
+            operation=operation,
+            persist=persist,
+            dry_run=dry_run,
+            strict=strict,
+        )
+        return {**edit_result, **_ProjectHistory.status()}
 
     updated = ArchitectureDescriptor.from_dict(edit_result["descriptor"])
 
-    if not dry_run and persist:
-        saveProjectDescriptor(updated)
-        _sync_weights_after_edit(updated)
+    if not dry_run:
+        # Record the pre-edit descriptor so Undo reverses this edit (not an older save).
+        if before_dict != updated.to_dict():
+            _ProjectHistory.push_undo(before_dict)
+        # Always write descriptor.json so undo/redo's "current" state matches the
+        # canvas. ``persist`` additionally syncs the .pt2/weights artifact.
+        # History is already recorded above — never push again from the file.
+        saveProjectDescriptor(updated, record_undo=False, strict=persist)
+        if persist:
+            _sync_model_file_after_edit(updated)
 
     if dry_run:
         graph = visualizeModel(updated.to_dict(), view_mode=view_mode, expanded_nodes=expanded_nodes or [])
     else:
         graph = refreshModelVisualization(updated, view_mode=view_mode, expanded_nodes=expanded_nodes or [])
     edit_result["graph"] = graph
+    if isinstance(graph, dict) and graph.get("warnings") is not None:
+        edit_result["warnings"] = graph["warnings"]
+    elif "warnings" not in edit_result:
+        edit_result["warnings"] = _collect_descriptor_warnings(updated)
+    edit_result.update(_ProjectHistory.status())
     return edit_result
 
 
@@ -894,10 +1063,34 @@ def saveModelDescriptor(
         descriptor = ArchitectureDescriptor.from_dict(descriptor_dict)
     else:
         descriptor = ArchitectureDescriptor.from_dict(validation["descriptor"])
-    saveProjectDescriptor(descriptor)
-    _sync_weights_after_edit(descriptor)
+
+    # Edits already push undo snapshots. Save only commits descriptor.json +
+    # the model artifact so reopen/export cannot fall back to a stale .pt2.
+    previous_disk: Optional[Dict[str, Any]] = None
+    descriptor_path = project_path(DESCRIPTOR_FILENAME)
+    if os.path.exists(descriptor_path):
+        try:
+            with open(descriptor_path, "r", encoding="utf-8") as f:
+                previous_disk = json.load(f)
+        except Exception:
+            previous_disk = None
+
+    new_dict = descriptor.to_dict()
+    if previous_disk is not None and previous_disk != new_dict:
+        _ProjectHistory.push_undo(previous_disk)
+
+    saveProjectDescriptor(descriptor, record_undo=False, strict=True)
+    _sync_model_file_after_edit(descriptor)
     graph = refreshModelVisualization(descriptor, view_mode=view_mode, expanded_nodes=expanded_nodes or [])
-    return {"success": True, "descriptor": descriptor.to_dict(), "graph": graph, "shapes": validation.get("shapes", {})}
+    warnings = validation.get("warnings") or graph.get("warnings") or _collect_descriptor_warnings(descriptor)
+    return {
+        "success": True,
+        "descriptor": descriptor.to_dict(),
+        "graph": graph,
+        "shapes": validation.get("shapes", {}) or graph.get("shapes", {}),
+        "warnings": warnings,
+        **_ProjectHistory.status(),
+    }
 
 
 def checkEdgeCompatibility(
@@ -920,49 +1113,72 @@ def checkEdgeCompatibility(
         tgt_node = node_map.get(target)
 
         if src_node is None and source != "input":
-            return {"compatible": False, "code": "NODE_NOT_FOUND", "field": "source",
-                    "error": f"Source node not found: {source}"}
+            reason = f"Source node not found: {source}"
+            log_blocked("checkEdge", reason, code="NODE_NOT_FOUND", source=source, target=target)
+            return {"compatible": False, "code": "NODE_NOT_FOUND", "field": "source", "error": reason}
         if tgt_node is None and target != "output":
-            return {"compatible": False, "code": "NODE_NOT_FOUND", "field": "target",
-                    "error": f"Target node not found: {target}"}
+            reason = f"Target node not found: {target}"
+            log_blocked("checkEdge", reason, code="NODE_NOT_FOUND", source=source, target=target)
+            return {"compatible": False, "code": "NODE_NOT_FOUND", "field": "target", "error": reason}
 
         # For virtual input/output, we can't check ports — skip port validation
         if source != "input" and src_node is not None:
             src_ports = _ports_for(src_node.type)
             if not any(p["id"] == source_port for p in src_ports["outputs"]):
+                reason = f"Source port '{source_port}' does not exist on {src_node.type}"
+                available = [p["id"] for p in src_ports["outputs"]]
+                log_blocked(
+                    "checkEdge", reason, code="PORT_NOT_FOUND",
+                    source=source, target=target, sourcePort=source_port, availablePorts=available,
+                )
                 return {
                     "compatible": False,
                     "code": "PORT_NOT_FOUND",
                     "field": "sourcePort",
-                    "error": f"Source port '{source_port}' does not exist on {src_node.type}",
-                    "availablePorts": [p["id"] for p in src_ports["outputs"]],
+                    "error": reason,
+                    "availablePorts": available,
                 }
 
         if target != "output" and tgt_node is not None:
             tgt_ports = _ports_for(tgt_node.type)
             if not any(p["id"] == target_port for p in tgt_ports["inputs"]):
+                reason = f"Target port '{target_port}' does not exist on {tgt_node.type}"
+                available = [p["id"] for p in tgt_ports["inputs"]]
+                log_blocked(
+                    "checkEdge", reason, code="PORT_NOT_FOUND",
+                    source=source, target=target, targetPort=target_port, availablePorts=available,
+                )
                 return {
                     "compatible": False,
                     "code": "PORT_NOT_FOUND",
                     "field": "targetPort",
-                    "error": f"Target port '{target_port}' does not exist on {tgt_node.type}",
-                    "availablePorts": [p["id"] for p in tgt_ports["inputs"]],
+                    "error": reason,
+                    "availablePorts": available,
                 }
 
             # Check compatibility hints only for real target nodes
             hint = COMPATIBILITY_HINTS.get(tgt_node.type)
             if hint and src_node is not None and src_node.type not in hint.get("accepts", []) and "*" not in hint.get("accepts", []):
+                reason = (
+                    f"{tgt_node.type} does not accept connections from {src_node.type}. "
+                    f"{hint.get('note', '')}"
+                ).strip()
+                log_blocked(
+                    "checkEdge", reason, code="COMPATIBILITY_VIOLATION",
+                    source=source, target=target, sourceType=src_node.type, targetType=tgt_node.type,
+                )
                 return {
                     "compatible": False,
                     "code": "COMPATIBILITY_VIOLATION",
                     "field": None,
-                    "error": f"{tgt_node.type} does not accept connections from {src_node.type}. {hint.get('note', '')}",
+                    "error": reason,
                     "hint": hint,
                 }
 
         if any(e.source == source and e.target == target for e in descriptor.edges):
-            return {"compatible": False, "code": "DUPLICATE_EDGE", "field": None,
-                    "error": "Edge already exists"}
+            reason = "Edge already exists"
+            log_blocked("checkEdge", reason, code="DUPLICATE_EDGE", source=source, target=target)
+            return {"compatible": False, "code": "DUPLICATE_EDGE", "field": None, "error": reason}
 
         descriptor.edges.append(Edge(source=source, target=target, source_port=source_port, target_port=target_port))
         descriptor.normalize_inplace(strict=False)
@@ -982,6 +1198,7 @@ def checkEdgeCompatibility(
             code = "CYCLE_DETECTED"
         elif "multiple inputs" in msg:
             code = "MULTI_INPUT_VIOLATION"
+        log_blocked("checkEdge", msg, code=code, source=source, target=target)
         return {"compatible": False, "error": msg, "code": code, "field": None}
 
 
@@ -993,6 +1210,7 @@ def visualizeModel(
     if descriptor_dict:
         validation = validateDescriptorPayload(descriptor_dict, strict=False)
         if not validation.get("valid"):
+            # validateDescriptorPayload already logs
             return validation
         descriptor = ArchitectureDescriptor.from_dict(validation["descriptor"])
     else:
@@ -1007,12 +1225,20 @@ def visualizeModel(
         graph = descriptorToGraph(descriptor)
 
     if "error" in graph:
+        log_blocked(
+            "visualize",
+            str(graph.get("error")),
+            code=graph.get("code") or "VISUALIZE_FAILED",
+            viewMode=view_mode,
+        )
         return graph
 
     # --- DRAFT NODE METADATA ---
     draft_ids = _get_draft_node_ids(descriptor)
     graph["draftNodes"] = sorted(draft_ids)
     graph["activeNodes"] = sorted({n.id for n in descriptor.nodes} - draft_ids)
+    graph["warnings"] = _collect_descriptor_warnings(descriptor)
+    graph["shapes"] = _propagate_shapes_with_drafts(descriptor, strict=False)
     if "nodes" in graph:
         for node_entry in graph["nodes"]:
             node_entry["isDraft"] = node_entry.get("id") in draft_ids
@@ -1122,6 +1348,62 @@ def _sync_weights_after_edit(descriptor: ArchitectureDescriptor) -> Optional[Dic
     except Exception as exc:
         logger.warning("Weight sync after edit failed: %s", exc)
         return None
+
+
+def _sync_json_pt2_after_edit(descriptor: ArchitectureDescriptor) -> bool:
+    """Rewrite JSON-architecture .pt2 files so reopen/analyse sees the latest save.
+
+    Editor-created models are plain JSON written as ``.pt2``. Saving only
+    ``descriptor.json`` left the ``.pt2`` stale; a later analyse/visualise of
+    that file would clobber the descriptor back to the first version.
+    """
+    info_path = project_path("projectInfo.json")
+    if not os.path.exists(info_path):
+        return False
+
+    try:
+        with open(info_path, "r", encoding="utf-8") as f:
+            project_info = json.load(f)
+    except Exception:
+        return False
+
+    model_filepath = (
+        project_info.get("modelFilepath", "")
+        or project_info.get("uploadedPt2Filepath", "")
+    )
+    if not model_filepath or not model_filepath.lower().endswith(".pt2"):
+        return False
+
+    out_path = project_path(model_filepath)
+    if not os.path.exists(out_path):
+        return False
+
+    try:
+        with open(out_path, "rb") as f:
+            raw = f.read()
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, OSError):
+        return False
+
+    if not isinstance(payload, dict) or "nodes" not in payload:
+        return False
+
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(descriptor.to_dict(), f, indent=2)
+        return True
+    except OSError as exc:
+        logger.warning("JSON .pt2 sync after edit failed: %s", exc)
+        return False
+
+
+def _sync_model_file_after_edit(descriptor: ArchitectureDescriptor) -> Optional[Dict[str, Any]]:
+    """Keep the on-disk model artifact aligned with descriptor.json after saves."""
+    report = _sync_weights_after_edit(descriptor)
+    if report is not None:
+        return report
+    _sync_json_pt2_after_edit(descriptor)
+    return None
 
 
 def exportUploadedPt2ToOnnx(pt2_filename: str, previous_onnx_filename: str = "") -> Dict[str, Any]:

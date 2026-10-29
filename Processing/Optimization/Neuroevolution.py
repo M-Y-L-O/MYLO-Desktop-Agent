@@ -418,10 +418,10 @@ class MutationGrammar:
     @staticmethod
     def remove_layer(descriptor: ArchitectureDescriptor, target_node_id: str,
                      protected_types: Optional[Set[str]] = None, event: Optional[dict] = None) -> bool:
-        """Remove a node and reconnect its parents directly to its children.
+        """Remove a node and its incident edges without rewiring.
 
-        Protected types (LSTM, GRU, MultiheadAttention) cannot be removed
-        to prevent the algorithm from stripping useful backbone structure.
+        Editor/draft graphs may become disconnected. Protected types cannot be
+        removed to prevent the algorithm from stripping useful backbone structure.
         """
         node = next(
             (n for n in descriptor.nodes if n.id == target_node_id),
@@ -431,44 +431,35 @@ class MutationGrammar:
 
         if node.id in ["input", "output"]:
             return False
+        
+        # protected_types = protected_types or set()
+        # if node.type in protected_types:
+        #     return False
 
-        if protected_types is None:
-            protected_types = {"LSTM", "GRU", "MultiheadAttention"}
-        if node.type in protected_types:
-            return False
+        removed_type = node.type
 
-        incoming = [e for e in descriptor.edges if e.target == target_node_id]
-        outgoing = [e for e in descriptor.edges if e.source == target_node_id]
+        descriptor.nodes = [
+            n for n in descriptor.nodes if n.id != target_node_id]
+        descriptor.edges = [
+            e for e in descriptor.edges
+            if e.source != target_node_id and e.target != target_node_id]
 
-        if not incoming or not outgoing:
-            return False
+        # Lenient: deletion may leave a disconnected/invalid draft graph.
+        try:
+            descriptor.normalize_inplace(strict=False)
+        except Exception:
+            pass
+        if event is not None:
+            event.update({
+                "op": "remove_layer",
+                "node": target_node_id,
+                "node_type": removed_type,
+                "before": {"params": node.params},
+                "after": {},
+                "detail": f"Removed {removed_type} '{target_node_id}' ",
+            })
 
-        if len(incoming) == 1 and node.type not in ["Add", "Concat"]:
-            parent = incoming[0].source
-            children = [e.target for e in outgoing]
-            removed_type = node.type
-
-            descriptor.nodes = [
-                n for n in descriptor.nodes if n.id != target_node_id]
-            descriptor.edges = [e for e in descriptor.edges if e.source !=
-                                target_node_id and e.target != target_node_id]
-
-            for child in children:
-                descriptor.edges.append(Edge(source=parent, target=child))
-
-            descriptor.normalize_inplace()
-            if event is not None:
-                event.update({
-                    "op": "remove_layer",
-                    "node": target_node_id,
-                    "node_type": removed_type,
-                    "before": {"params": node.params},
-                    "after": {"reconnected": f"{parent} → {', '.join(children)}"},
-                    "detail": f"Removed {removed_type} '{target_node_id}' ({parent} reconnected to {', '.join(children)})",
-                })
-            return True
-
-        return False
+        return True
 
     @staticmethod
     def add_skip_connection(

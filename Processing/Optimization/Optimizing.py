@@ -284,10 +284,17 @@ async def startOptimization(project: ProjectData, requestInfo: OptimizationReque
             ),
         )
 
-    if "model_path" not in result:
-        return {"error": "Optimization failed", "details": result}
+    if isinstance(result, dict) and "model_path" in result:
+        return result
 
-    return result
+    # Preserve the real failure reason instead of burying it under a generic wrap.
+    if isinstance(result, dict) and result.get("error"):
+        return result
+
+    return {
+        "error": "Optimization failed",
+        "details": result if result is not None else "No result returned",
+    }
 
 
 def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationRequest, isPytorchModel, statusCallback=None, weightBytes=None):
@@ -316,7 +323,32 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         problem_type = _request_problem_type(requestInfo)
 
         statusCallback({"type": "phase", "phase": "loading_descriptor", "status": "Loading architecture descriptor...", "progress": 25})
-        initialDescriptor = loadProjectDescriptor()
+        # Prefer architecture from the model file being optimized. Falling back to
+        # project descriptor.json avoids inventing a default feedforward, but still
+        # covers editor sessions where the on-disk .pt2 and descriptor stay in sync.
+        try:
+            initialDescriptor = loadDescriptorFromBytes(
+                modelBytes,
+                isPytorchModel,
+                inputDim,
+                outputDim,
+                fallback_default=False,
+            )
+        except Exception as desc_exc:
+            logger.warning(
+                "Could not load descriptor from model file (%s); falling back to project descriptor.json",
+                desc_exc,
+            )
+            try:
+                initialDescriptor = loadProjectDescriptor(project.modelFilepath or "")
+            except Exception as project_exc:
+                return {
+                    "error": (
+                        f"Could not load architecture descriptor from model file "
+                        f"({desc_exc}) or project descriptor ({project_exc})"
+                    )
+                }
+
         parent_state_dict = None
         if weightBytes is not None:
             statusCallback({"type": "phase", "phase": "loading_weights", "status": "Loading parent weights...", "progress": 30})
