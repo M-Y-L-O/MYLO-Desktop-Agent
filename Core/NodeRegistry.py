@@ -1,6 +1,24 @@
+import inspect
+import os
 import torch
 import torch.nn as nn
-from typing import Dict, Any, Type
+from typing import Any, Dict, List, Optional, Type
+
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def experimental_nodes_enabled() -> bool:
+    """Whether experimental / auto-discovered torch.nn nodes are active.
+
+    Reads ``ENABLE_EXPERIMENTAL_NODES`` from the environment (``.env`` via
+    ``load_dotenv``). Defaults to off.
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    return os.getenv("ENABLE_EXPERIMENTAL_NODES", "").strip().lower() in _TRUTHY
 
 
 class _Add(nn.Module):
@@ -105,25 +123,261 @@ class _SelfAttention(nn.Module):
         output, _ = self.attention(x, x, x, need_weights=False)
         return output
 
+
+def _params_from_signature(signature: inspect.Signature, *, skip: frozenset[str] = frozenset()) -> Dict[str, str]:
+    params: Dict[str, str] = {}
+    for name, param in signature.parameters.items():
+        if name in ("self", "args", "kwargs") or name in skip:
+            continue
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
+        params[name] = name
+    return params
+
+
+def get_constructor_params(module_cls: Type[nn.Module]) -> Dict[str, str]:
+    """Map node param names to matching ``__init__`` parameter names.
+
+    Walks the MRO when a class only exposes ``*args, **kwargs`` (e.g. LSTM/GRU).
+    """
+    skip_by_base = {
+        "RNNBase": frozenset({"mode"}),
+    }
+
+    for candidate in module_cls.__mro__:
+        if candidate is object:
+            break
+        init = getattr(candidate, "__init__", None)
+        if init is None:
+            continue
+        try:
+            signature = inspect.signature(init)
+        except (TypeError, ValueError):
+            continue
+        skip = skip_by_base.get(candidate.__name__, frozenset())
+        params = _params_from_signature(signature, skip=skip)
+        if params:
+            # Drop factory kwargs that nodes never supply explicitly.
+            params.pop("device", None)
+            params.pop("dtype", None)
+            return params
+    return {}
+
+
+# Containers / wrappers that are not suitable as graph nodes.
+EXCLUDED_MODULES = {
+    "Module",
+    "Sequential",
+    "ModuleList",
+    "ModuleDict",
+    "ParameterList",
+    "ParameterDict",
+    "Container",
+    "DataParallel",
+}
+
+# Explicit execution / module overrides for non-standard forward semantics.
+SPECIAL_NODES: Dict[str, Dict[str, Any]] = {
+    "LSTM": {
+        "execution_op": "recurrent_lstm",
+    },
+    "GRU": {
+        "execution_op": "recurrent_gru",
+    },
+    "MultiheadAttention": {
+        "execution_op": "self_attention",
+        "module_cls": _SelfAttention,
+    },
+    "TransformerEncoderLayer": {
+        "module_cls": _TransformerEncoderLayer,
+    },
+}
+
+# Graph-level / alias nodes that are not plain torch.nn classes.
+CUSTOM_NODES: Dict[str, Dict[str, Any]] = {
+    "Input": {
+        "module_cls": nn.Identity,
+        "param_mapping": {},
+    },
+    "Output": {
+        "module_cls": nn.Identity,
+        "param_mapping": {},
+    },
+    "Add": {
+        "module_cls": _Add,
+        "param_mapping": {},
+        "execution_op": "merge_add",
+    },
+    "Concat": {
+        "module_cls": _Concat,
+        "param_mapping": {"dim": "dim"},
+        "execution_op": "merge_concat",
+    },
+    "Unsqueeze": {
+        "module_cls": _Unsqueeze,
+        "param_mapping": {"dim": "dim"},
+    },
+    "Squeeze": {
+        "module_cls": _Squeeze,
+        "param_mapping": {"dim": "dim"},
+    },
+    "ReduceMean": {
+        "module_cls": _ReduceMean,
+        # "axes" is kept as a legacy alias for "dim"
+        "param_mapping": {"dim": "dim", "keepdim": "keepdim", "axes": "dim"},
+    },
+    "Transpose": {
+        "module_cls": _Transpose,
+        "param_mapping": {"dim0": "dim0", "dim1": "dim1"},
+    },
+    "Permute": {
+        "module_cls": _Permute,
+        "param_mapping": {"dims": "dims"},
+    },
+    "Reshape": {
+        "module_cls": _Reshape,
+        "param_mapping": {"target_shape": "target_shape"},
+    },
+}
+
+# Nodes the editor / parser should treat as first-class (not experimental).
+SUPPORTED_NODES = {
+    "Linear",
+    "Input",
+    "Output",
+    "Conv1d",
+    "Conv2d",
+    "LSTM",
+    "GRU",
+    "ReLU",
+    "GELU",
+    "SiLU",
+    "Tanh",
+    "Sigmoid",
+    "Softmax",
+    "LogSoftmax",
+    "Dropout",
+    "Flatten",
+    "BatchNorm1d",
+    "BatchNorm2d",
+    "Add",
+    "Concat",
+    "Unsqueeze",
+    "Squeeze",
+    "ReduceMean",
+    "Transpose",
+    "Permute",
+    "Identity",
+    "Reshape",
+    "LayerNorm",
+    "Embedding",
+    "ConvTranspose1d",
+    "ConvTranspose2d",
+    "MaxPool1d",
+    "AvgPool1d",
+    "MaxPool2d",
+    "AvgPool2d",
+    "TransformerEncoderLayer",
+    "MultiheadAttention",
+}
+
+
 class NodeRegistry:
-    """Registry that maps textual node types to PyTorch operations and semantics."""
-    
+    """Registry that maps textual node types to PyTorch operations and semantics.
+
+    Built once per process from ``ENABLE_EXPERIMENTAL_NODES`` and then cached.
+    """
+
     _registry: Dict[str, Dict[str, Any]] = {}
+    _defaults_registered: bool = False
+    _include_experimental: bool = False
 
     @classmethod
-    def register(cls, node_type: str, module_cls: Type[nn.Module], param_mapping: Dict[str, str], execution_op: str = "standard_forward"):
+    def register(
+        cls,
+        node_type: str,
+        module_cls: Type[nn.Module],
+        param_mapping: Optional[Dict[str, str]] = None,
+        execution_op: str = "standard_forward",
+        *,
+        supported: Optional[bool] = None,
+        experimental: Optional[bool] = None,
+    ):
+        is_supported = (node_type in SUPPORTED_NODES) if supported is None else supported
+        is_experimental = (not is_supported) if experimental is None else experimental
         cls._registry[node_type] = {
             "module_cls": module_cls,
-            "param_mapping": param_mapping,
-            "execution_op": execution_op
+            "param_mapping": param_mapping if param_mapping is not None else {},
+            "execution_op": execution_op,
+            "supported": is_supported,
+            "experimental": is_experimental,
         }
 
     @classmethod
+    def auto_register(cls, namespace=nn, *, include_experimental: Optional[bool] = None) -> int:
+        """Discover ``nn.Module`` subclasses and register them with constructor params."""
+        if include_experimental is None:
+            include_experimental = experimental_nodes_enabled()
+
+        registered = 0
+        for name, obj in inspect.getmembers(namespace):
+            if not inspect.isclass(obj):
+                continue
+            try:
+                if not issubclass(obj, nn.Module):
+                    continue
+            except TypeError:
+                continue
+            if inspect.isabstract(obj) or name.startswith("_"):
+                continue
+            if name in EXCLUDED_MODULES or name.startswith("Lazy"):
+                continue
+            if name.endswith("Loss"):
+                continue
+
+            is_supported = name in SUPPORTED_NODES
+            if not is_supported and not include_experimental:
+                continue
+
+            special = SPECIAL_NODES.get(name, {})
+            module_cls = special.get("module_cls", obj)
+            param_mapping = special.get("param_mapping")
+            if param_mapping is None:
+                param_mapping = get_constructor_params(module_cls)
+
+            cls.register(
+                node_type=name,
+                module_cls=module_cls,
+                param_mapping=param_mapping,
+                execution_op=special.get("execution_op", "standard_forward"),
+                supported=is_supported,
+            )
+            registered += 1
+        return registered
+
+    @classmethod
+    def register_custom_nodes(cls) -> None:
+        for name, spec in CUSTOM_NODES.items():
+            cls.register(
+                node_type=name,
+                module_cls=spec["module_cls"],
+                param_mapping=spec.get("param_mapping", {}),
+                execution_op=spec.get("execution_op", "standard_forward"),
+                supported=name in SUPPORTED_NODES,
+            )
+
+    @classmethod
+    def ensure_initialized(cls) -> None:
+        """Build the registry once for this process if it has not been built yet."""
+        cls._register_defaults()
+
+    @classmethod
     def get_module(cls, node_type: str, params: Dict[str, Any]) -> nn.Module:
-        if node_type not in cls._registry:
-            # Fallback mappings for standard types if not explicitly registered
-            cls._register_defaults()
-            
+        cls._register_defaults()
+
         if node_type not in cls._registry:
             raise ValueError(f"Unknown node type: {node_type}")
 
@@ -143,88 +397,50 @@ class NodeRegistry:
 
     @classmethod
     def get_execution_semantic(cls, node_type: str) -> str:
-        if node_type not in cls._registry:
-             cls._register_defaults()
+        cls._register_defaults()
         if node_type not in cls._registry:
             return "standard_forward"
         return cls._registry[node_type].get("execution_op", "standard_forward")
 
     @classmethod
+    def is_supported(cls, node_type: str) -> bool:
+        cls._register_defaults()
+        entry = cls._registry.get(node_type)
+        return bool(entry and entry.get("supported"))
+
+    @classmethod
+    def is_experimental(cls, node_type: str) -> bool:
+        cls._register_defaults()
+        entry = cls._registry.get(node_type)
+        return bool(entry and entry.get("experimental"))
+
+    @classmethod
+    def experimental_enabled(cls) -> bool:
+        cls._register_defaults()
+        return cls._include_experimental
+
+    @classmethod
+    def list_nodes(cls, *, supported_only: bool = False) -> List[str]:
+        cls._register_defaults()
+        names = sorted(cls._registry.keys())
+        if supported_only:
+            return [name for name in names if cls._registry[name].get("supported")]
+        return names
+
+    @classmethod
+    def get_entry(cls, node_type: str) -> Optional[Dict[str, Any]]:
+        cls._register_defaults()
+        return cls._registry.get(node_type)
+
+    @classmethod
     def _register_defaults(cls):
-        # Prevent duplicate registrations
-        if "Linear" in cls._registry:
+        if cls._defaults_registered:
             return
-            
-        cls.register("Linear", nn.Linear, {"in_features": "in_features", "out_features": "out_features", "bias": "bias"})
-        cls.register("Input", nn.Identity, {})
-        cls.register("Output", nn.Identity, {})
-        convolution_params = {name: name for name in (
-            "in_channels", "out_channels", "kernel_size", "stride", "padding",
-            "dilation", "groups", "bias", "padding_mode",
-        )}
-        cls.register("Conv1d", nn.Conv1d, convolution_params)
-        cls.register("Conv2d", nn.Conv2d, convolution_params)
-        recurrent_params = {name: name for name in (
-            "input_size", "hidden_size", "num_layers", "bias", "batch_first",
-            "dropout", "bidirectional",
-        )}
-        cls.register("LSTM", nn.LSTM, recurrent_params, execution_op="recurrent_lstm")
-        cls.register("GRU", nn.GRU, recurrent_params, execution_op="recurrent_gru")
-        cls.register("ReLU", nn.ReLU, {})
-        cls.register("GELU", nn.GELU, {"approximate": "approximate"})
-        cls.register("SiLU", nn.SiLU, {"inplace": "inplace"})
-        cls.register("Tanh", nn.Tanh, {})
-        cls.register("Sigmoid", nn.Sigmoid, {})
-        cls.register("Softmax", nn.Softmax, {"dim": "dim"})
-        cls.register("LogSoftmax", nn.LogSoftmax, {"dim": "dim"})
-        cls.register("Dropout", nn.Dropout, {"p": "p", "inplace": "inplace"})
-        cls.register("Flatten", nn.Flatten, {"start_dim": "start_dim", "end_dim": "end_dim"})
-        batch_norm_params = {name: name for name in (
-            "num_features", "eps", "momentum", "affine", "track_running_stats",
-        )}
-        cls.register("BatchNorm1d", nn.BatchNorm1d, batch_norm_params)
-        cls.register("BatchNorm2d", nn.BatchNorm2d, batch_norm_params)
+        include_experimental = experimental_nodes_enabled()
+        cls._include_experimental = include_experimental
+        cls.auto_register(include_experimental=include_experimental)
+        cls.register_custom_nodes()
+        cls._defaults_registered = True
 
-        cls.register("Add", _Add, {}, execution_op="merge_add")
-        cls.register("Concat", _Concat, {"dim": "dim"}, execution_op="merge_concat")
-        cls.register("Unsqueeze", _Unsqueeze, {"dim": "dim"})
-        cls.register("Squeeze", _Squeeze, {"dim": "dim"})
-        cls.register("ReduceMean", _ReduceMean, {"dim": "dim", "keepdim": "keepdim", "axes": "dim"})
-        cls.register("Transpose", _Transpose, {"dim0": "dim0", "dim1": "dim1"})
-        cls.register("Permute", _Permute, {"dims": "dims"})
-        cls.register("Identity", nn.Identity, {})
-        cls.register("Reshape", _Reshape, {"target_shape": "target_shape"})
-        cls.register("LayerNorm", nn.LayerNorm, {"normalized_shape": "normalized_shape", "eps": "eps", "elementwise_affine": "elementwise_affine", "bias": "bias"})
-        cls.register("Embedding", nn.Embedding, {"num_embeddings": "num_embeddings", "embedding_dim": "embedding_dim", "padding_idx": "padding_idx", "scale_grad_by_freq": "scale_grad_by_freq", "sparse": "sparse"})
-        transpose_convolution_params = dict(convolution_params, output_padding="output_padding")
-        cls.register("ConvTranspose1d", nn.ConvTranspose1d, transpose_convolution_params)
-        cls.register("ConvTranspose2d", nn.ConvTranspose2d, transpose_convolution_params)
-        max_pool_params = {name: name for name in ("kernel_size", "stride", "padding", "dilation", "ceil_mode")}
-        avg_pool_params = {name: name for name in ("kernel_size", "stride", "padding", "ceil_mode", "count_include_pad")}
-        cls.register("MaxPool1d", nn.MaxPool1d, max_pool_params)
-        cls.register("AvgPool1d", nn.AvgPool1d, avg_pool_params)
-        cls.register("MaxPool2d", nn.MaxPool2d, max_pool_params)
-        cls.register("AvgPool2d", nn.AvgPool2d, dict(avg_pool_params, divisor_override="divisor_override"))
 
-        cls.register(
-            "TransformerEncoderLayer",
-            _TransformerEncoderLayer,
-            {
-                "d_model": "d_model",
-                "nhead": "nhead",
-                "dim_feedforward": "dim_feedforward",
-                "dropout": "dropout",
-                "batch_first": "batch_first",
-                "norm_first": "norm_first",
-            },
-        )
-
-        cls.register(
-            "MultiheadAttention",
-            _SelfAttention,
-            {"embed_dim": "embed_dim", "num_heads": "num_heads", "batch_first": "batch_first"},
-            execution_op="self_attention",
-        )
-
-# defaults
-NodeRegistry._register_defaults()
+# Built lazily on first access so ``.env`` is loaded before registration.

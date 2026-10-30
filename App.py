@@ -862,7 +862,11 @@ async def collapseModelNodes(request: Request):
 
 @app.get("/editor/catalog")
 async def editor_catalog():
-    """Return the node catalog for the model editor UI."""
+    """Return the node catalog for the model editor UI.
+
+    Generated once per process from NodeRegistry. Experimental / auto-discovered
+    nodes are included when ENABLE_EXPERIMENTAL_NODES=1 in .env.
+    """
     return JSONResponse(get_catalog())
 
 

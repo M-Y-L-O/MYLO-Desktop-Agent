@@ -1,5 +1,17 @@
-import json
+import inspect
+from typing import Any, Dict, List, Optional, get_args, get_origin
+
+from Core.NodeRegistry import NodeRegistry
 from Processing.Models.ModelEditing import ModelEditEngine
+
+# Process-lifetime cache: catalog is generated once from the registry + env flag.
+_CATALOG_CACHE: Dict[bool, Dict[str, Any]] = {}
+
+# ---------------------------------------------------------------------------
+# Curated catalog overrides
+# Types that appear in both NodeRegistry and these tables keep this hand-tuned
+# structure. Everything else is generated from the registry at catalog build time.
+# ---------------------------------------------------------------------------
 
 # Grouping of node types for UI catalogs
 NODE_GROUPS = {
@@ -743,18 +755,363 @@ TEMPLATES = {
 }
 
 
-def _default_params(node_type: str):
-    """Return default params for a given node type using ModelEditEngine helper."""
-    return ModelEditEngine._default_params_for_type(node_type, 64)
+# ---------------------------------------------------------------------------
+# Automatic catalog generation from NodeRegistry
+# ---------------------------------------------------------------------------
+
+_DIMENSION_PARAMS = {
+    "in_features", "out_features", "in_channels", "out_channels", "num_features",
+    "hidden_size", "input_size", "embed_dim", "num_embeddings", "embedding_dim",
+    "normalized_shape", "d_model", "num_heads", "nhead", "dim_feedforward",
+    "num_groups", "num_channels", "kernel_size", "stride", "padding", "output_padding",
+    "dilation", "groups", "start_dim", "end_dim", "dim", "dim0", "dim1", "dims",
+    "target_shape", "axes",
+}
+
+_ADVANCED_PARAMS = {
+    "eps", "momentum", "inplace", "bias", "affine", "track_running_stats",
+    "elementwise_affine", "padding_mode", "ceil_mode", "count_include_pad",
+    "divisor_override", "scale_grad_by_freq", "sparse", "padding_idx",
+    "norm_first", "approximate", "proj_size", "device", "dtype",
+}
+
+_ACTIVATION_NAMES = {
+    "ReLU", "RReLU", "LeakyReLU", "PReLU", "Softplus", "ELU", "CELU", "SELU",
+    "GELU", "SiLU", "Mish", "Hardswish", "Hardtanh", "Hardsigmoid", "Hardshrink",
+    "Softshrink", "Tanh", "Tanhshrink", "Sigmoid", "Softmax", "LogSoftmax",
+    "Softmin", "GLU", "Identity",
+}
 
 
-def get_catalog() -> dict:
-    """Return the full editor catalog, including groups, limits, operations, and per-node parameter schemas."""
-    all_types = list(set(ModelEditEngine.INSERTABLE_TYPES + list(ModelEditEngine.PROTECTED_TYPES) + ["Concat", "Add"]))
-    catalog = {
+def _humanize_param(name: str) -> str:
+    return name.replace("_", " ").strip().title()
+
+
+def _type_name(annotation: Any) -> str:
+    return getattr(annotation, "__name__", "") or ""
+
+
+def _annotation_widget_type(annotation: Any, default: Any) -> str:
+    from typing import Literal, Union
+
+    if annotation is not inspect.Parameter.empty:
+        origin = get_origin(annotation)
+        args = [a for a in get_args(annotation) if a is not type(None)]
+
+        if annotation is bool or _type_name(annotation) == "bool":
+            return "boolean"
+        if annotation is int or _type_name(annotation) == "int":
+            return "integer"
+        if annotation is float or _type_name(annotation) == "float":
+            return "float"
+        if annotation is str or _type_name(annotation) == "str":
+            return "string"
+        if origin is list or origin is tuple:
+            return "array"
+        if origin is Literal:
+            return "enum"
+        if origin is Union:
+            if any(get_origin(a) is Literal for a in args):
+                return "enum"
+            if any(a is bool or _type_name(a) == "bool" for a in args) and len(args) == 1:
+                return "boolean"
+            if any(a is int or _type_name(a) == "int" for a in args):
+                return "integer"
+            if any(a is float or _type_name(a) == "float" for a in args):
+                return "float"
+            if any(a is str or _type_name(a) == "str" for a in args):
+                return "string"
+            if any(get_origin(a) in (list, tuple) or a in (list, tuple) for a in args):
+                return "array"
+
+    if default is not inspect.Parameter.empty and default is not None:
+        if isinstance(default, bool):
+            return "boolean"
+        if isinstance(default, int):
+            return "integer"
+        if isinstance(default, float):
+            return "float"
+        if isinstance(default, str):
+            return "string"
+        if isinstance(default, (list, tuple)):
+            return "array"
+
+    return "string"
+
+
+def _heuristic_widget_type(param_name: str, annotation: Any, default: Any) -> str:
+    widget = _annotation_widget_type(annotation, default)
+    if widget != "string":
+        return widget
+    if param_name in _DIMENSION_PARAMS or param_name.endswith(("_dim", "_size", "_features", "_channels")):
+        return "integer"
+    if param_name in {"p", "dropout", "eps", "momentum", "negative_slope", "alpha"}:
+        return "float"
+    if param_name.startswith("is_") or param_name.startswith("use_") or param_name in {
+        "bias", "affine", "inplace", "bidirectional", "batch_first", "keepdim",
+    }:
+        return "boolean"
+    return widget
+
+
+def _literal_values(annotation: Any) -> Optional[List[Any]]:
+    from typing import Literal, Union
+
+    if annotation is inspect.Parameter.empty:
+        return None
+    origin = get_origin(annotation)
+    if origin is Literal:
+        return list(get_args(annotation))
+    if origin is Union:
+        values: List[Any] = []
+        for arg in get_args(annotation):
+            if get_origin(arg) is Literal:
+                values.extend(get_args(arg))
+        return values or None
+    return None
+
+
+def _pytorch_help_url(node_type: str, module_cls: type) -> Optional[str]:
+    module_name = getattr(module_cls, "__module__", "") or ""
+    if module_name.startswith("torch.nn"):
+        return f"https://pytorch.org/docs/stable/generated/torch.nn.{node_type}.html"
+    # Wrappers that stand in for a public torch.nn class
+    if node_type in {"MultiheadAttention", "TransformerEncoderLayer"}:
+        return f"https://pytorch.org/docs/stable/generated/torch.nn.{node_type}.html"
+    return None
+
+
+def _param_field_blueprint(
+    param_name: str,
+    annotation: Any,
+    default: Any,
+    *,
+    help_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    has_default = default is not inspect.Parameter.empty
+    widget = _heuristic_widget_type(param_name, annotation, default)
+    field: Dict[str, Any] = {
+        "type": widget,
+        "label": _humanize_param(param_name),
+        "description": f"Constructor parameter `{param_name}`.",
+        "group": (
+            "Dimensions" if param_name in _DIMENSION_PARAMS
+            else "Advanced Settings" if param_name in _ADVANCED_PARAMS
+            else "Configuration"
+        ),
+        "advanced": param_name in _ADVANCED_PARAMS or (has_default and param_name not in _DIMENSION_PARAMS),
+        "required": not has_default,
+    }
+
+    if has_default and default is not None:
+        field["default"] = list(default) if isinstance(default, tuple) else default
+
+    if widget == "integer":
+        field.setdefault("step", 1)
+        if param_name in _DIMENSION_PARAMS:
+            field.setdefault("min", 1)
+            field.setdefault("max", 8192)
+            field.setdefault("default", field.get("default", 64))
+    elif widget == "float":
+        field.setdefault("step", 0.01 if param_name not in {"eps"} else 1e-6)
+        if param_name in {"p", "dropout", "negative_slope"}:
+            field.setdefault("min", 0.0)
+            field.setdefault("max", 1.0)
+
+    literal_vals = _literal_values(annotation)
+    if widget == "enum" and literal_vals:
+        field["values"] = list(literal_vals)
+        if "default" not in field and literal_vals:
+            field["default"] = literal_vals[0]
+
+    if help_url:
+        field["helpUrl"] = help_url
+
+    return field
+
+
+def _resolve_init_signature(module_cls: type):
+    """Return (signature, skip_names) walking MRO like NodeRegistry param discovery."""
+    skip_by_base = {"RNNBase": frozenset({"mode"})}
+    for candidate in module_cls.__mro__:
+        if candidate is object:
+            break
+        init = getattr(candidate, "__init__", None)
+        if init is None:
+            continue
+        try:
+            signature = inspect.signature(init)
+        except (TypeError, ValueError):
+            continue
+        skip = skip_by_base.get(candidate.__name__, frozenset())
+        usable = [
+            (n, p) for n, p in signature.parameters.items()
+            if n not in ("self", "args", "kwargs")
+            and n not in skip
+            and p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+            and n not in ("device", "dtype")
+        ]
+        if usable:
+            return usable
+    return []
+
+
+def generate_parameter_blueprint(node_type: str) -> Dict[str, Any]:
+    """Build a UI parameter blueprint from a registry module constructor."""
+    entry = NodeRegistry.get_entry(node_type)
+    if not entry:
+        return {}
+
+    module_cls = entry["module_cls"]
+    param_mapping: Dict[str, str] = dict(entry.get("param_mapping") or {})
+    help_url = _pytorch_help_url(node_type, module_cls)
+    sig_by_name = {name: param for name, param in _resolve_init_signature(module_cls)}
+
+    if not param_mapping:
+        param_mapping = {name: name for name in sig_by_name}
+
+    blueprint: Dict[str, Any] = {}
+    seen_ctor_names = set()
+
+    for node_param, ctor_name in param_mapping.items():
+        if node_param.startswith("_") or ctor_name.startswith("_"):
+            continue
+
+        param = sig_by_name.get(ctor_name)
+
+        # Alias for an already-emitted constructor param (e.g. axes -> dim)
+        if ctor_name in seen_ctor_names and node_param != ctor_name:
+            target = blueprint.get(ctor_name)
+            if target:
+                alias_field = dict(target)
+                alias_field["label"] = _humanize_param(node_param)
+                alias_field["description"] = f"Alias for `{ctor_name}`."
+                alias_field["advanced"] = True
+                blueprint[node_param] = alias_field
+            continue
+
+        if param is None:
+            continue
+
+        seen_ctor_names.add(ctor_name)
+        blueprint[node_param] = _param_field_blueprint(
+            node_param,
+            param.annotation,
+            param.default,
+            help_url=help_url,
+        )
+
+    return blueprint
+
+
+def _auto_group_for(node_type: str) -> str:
+    if node_type in {"Add", "Concat"}:
+        return "Merges"
+    if node_type in _ACTIVATION_NAMES:
+        return "Activations"
+    if "Pool" in node_type:
+        return "Pooling"
+    if node_type.startswith("Conv"):
+        return "Convolution"
+    if "Norm" in node_type:
+        return "Normalization"
+    if node_type in {"LSTM", "GRU", "RNN"} or node_type.endswith("Cell"):
+        return "Recurrent"
+    if "Attention" in node_type or "Transformer" in node_type:
+        return "Attention"
+    if node_type in {
+        "Unsqueeze", "Squeeze", "Transpose", "Permute", "Reshape", "Flatten", "ReduceMean",
+    }:
+        return "Shape"
+    if node_type == "Embedding":
+        return "Layers"
+    return "Layers"
+
+
+def build_parameter_blueprints(*, include_experimental: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Curated blueprints win; remaining registry nodes are auto-generated."""
+    node_names = (
+        NodeRegistry.list_nodes()
+        if include_experimental
+        else NodeRegistry.list_nodes(supported_only=True)
+    )
+
+    blueprints: Dict[str, Dict[str, Any]] = {}
+    for name in node_names:
+        if name in NODE_PARAMETER_BLUEPRINTS:
+            blueprints[name] = NODE_PARAMETER_BLUEPRINTS[name]
+        else:
+            blueprints[name] = generate_parameter_blueprint(name)
+
+    # Keep any curated entries that might not be in the filtered registry list
+    for name, curated in NODE_PARAMETER_BLUEPRINTS.items():
+        blueprints.setdefault(name, curated)
+
+    return blueprints
+
+
+def build_node_groups(*, include_experimental: bool = False) -> Dict[str, List[str]]:
+    """Start from curated groups, then append registry nodes that are missing."""
+    groups: Dict[str, List[str]] = {key: list(values) for key, values in NODE_GROUPS.items()}
+    listed = {name for values in groups.values() for name in values}
+
+    for name in NodeRegistry.list_nodes(supported_only=True):
+        if name in listed:
+            continue
+        group_name = _auto_group_for(name)
+        groups.setdefault(group_name, []).append(name)
+        listed.add(name)
+
+    if include_experimental:
+        experimental = [
+            name for name in NodeRegistry.list_nodes()
+            if name not in listed and NodeRegistry.is_experimental(name)
+        ]
+        if experimental:
+            groups["Experimental"] = sorted(experimental)
+
+    return groups
+
+
+def build_node_ports(node_types: List[str]) -> Dict[str, Any]:
+    """Curated port definitions win; everyone else gets DEFAULT_PORTS."""
+    return {name: PORT_DEFINITIONS.get(name, DEFAULT_PORTS) for name in node_types}
+
+
+def _default_params(node_type: str) -> Dict[str, Any]:
+    """Return default params for a given node type."""
+    curated = ModelEditEngine._default_params_for_type(node_type, 64)
+    if curated:
+        return curated
+
+    blueprint = NODE_PARAMETER_BLUEPRINTS.get(node_type)
+    if blueprint is None:
+        blueprint = generate_parameter_blueprint(node_type)
+
+    defaults: Dict[str, Any] = {}
+    for key, field in (blueprint or {}).items():
+        if isinstance(field, dict) and "default" in field:
+            defaults[key] = field["default"]
+    return defaults
+
+
+def _build_catalog(*, include_experimental: bool) -> dict:
+    """Build a fresh catalog snapshot (not cached)."""
+    NodeRegistry.ensure_initialized()
+    blueprints = build_parameter_blueprints(include_experimental=include_experimental)
+    groups = build_node_groups(include_experimental=include_experimental)
+    all_types = sorted({name for names in groups.values() for name in names})
+
+    return {
+        "experimentalNodesEnabled": include_experimental,
         "insertableTypes": ModelEditEngine.INSERTABLE_TYPES,
         "swappableActivations": ModelEditEngine.SWAPPABLE_ACTIVATIONS,
         "protectedTypes": sorted(ModelEditEngine.PROTECTED_TYPES),
+        "supportedTypes": NodeRegistry.list_nodes(supported_only=True),
+        "experimentalTypes": [
+            name for name in NodeRegistry.list_nodes()
+            if NodeRegistry.is_experimental(name)
+        ] if include_experimental else [],
         "limits": {
             "maxNodes": getattr(ModelEditEngine, "MAX_NODES", None),
             "maxDepth": getattr(ModelEditEngine, "MAX_DEPTH", None),
@@ -764,13 +1121,37 @@ def get_catalog() -> dict:
             "add_edge", "remove_edge", "insert_after", "scale_width", "add_skip_connection",
         ],
         "viewModes": ["summary", "detailed", "hybrid"],
-        "nodeGroups": NODE_GROUPS,
+        "nodeGroups": groups,
         "nodeSchemas": {node_type: _default_params(node_type) for node_type in all_types},
-        "nodeParameterBlueprints": NODE_PARAMETER_BLUEPRINTS,
-        "nodePorts": {ntype: PORT_DEFINITIONS.get(ntype, DEFAULT_PORTS) for ntype in all_types},
+        "nodeParameterBlueprints": blueprints,
+        "nodePorts": build_node_ports(all_types),
         "compatibilityHints": COMPATIBILITY_HINTS,
         "sourceOnly": list(SOURCE_ONLY),
         "targetBlocklist": list(TARGET_BLOCKLIST),
         "operationSchemas": OPERATION_SCHEMAS,
     }
+
+
+def get_catalog(*, include_experimental: Optional[bool] = None) -> dict:
+    """Return the editor catalog, generated once per process for the active env flag.
+
+    ``ENABLE_EXPERIMENTAL_NODES`` controls whether auto-discovered experimental
+    nodes are included. Pass ``include_experimental`` only to override (e.g. tests).
+    """
+    if include_experimental is None:
+        # Prefer the registry's frozen decision after first init.
+        NodeRegistry.ensure_initialized()
+        include_experimental = NodeRegistry.experimental_enabled()
+
+    cached = _CATALOG_CACHE.get(include_experimental)
+    if cached is not None:
+        return cached
+
+    catalog = _build_catalog(include_experimental=include_experimental)
+    _CATALOG_CACHE[include_experimental] = catalog
     return catalog
+
+
+def clear_catalog_cache() -> None:
+    """Drop cached catalogs (tests / rare runtime reconfiguration)."""
+    _CATALOG_CACHE.clear()
