@@ -881,6 +881,22 @@ def _pytorch_help_url(node_type: str, module_cls: type) -> Optional[str]:
     return None
 
 
+def _json_safe_value(value: Any) -> Any:
+    """Coerce constructor defaults into JSON-serializable catalog values."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, tuple):
+        return [_json_safe_value(v) for v in value]
+    if isinstance(value, list):
+        return [_json_safe_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    if callable(value):
+        return getattr(value, "__name__", None) or repr(value)
+    # torch.dtype / enums / odd objects → stable string label
+    return str(value)
+
+
 def _param_field_blueprint(
     param_name: str,
     annotation: Any,
@@ -890,6 +906,10 @@ def _param_field_blueprint(
 ) -> Dict[str, Any]:
     has_default = default is not inspect.Parameter.empty
     widget = _heuristic_widget_type(param_name, annotation, default)
+    # Callable defaults (e.g. Transformer.activation=relu) are exposed as strings.
+    if has_default and callable(default) and not isinstance(default, type):
+        widget = "string"
+
     field: Dict[str, Any] = {
         "type": widget,
         "label": _humanize_param(param_name),
@@ -904,7 +924,7 @@ def _param_field_blueprint(
     }
 
     if has_default and default is not None:
-        field["default"] = list(default) if isinstance(default, tuple) else default
+        field["default"] = _json_safe_value(default)
 
     if widget == "integer":
         field.setdefault("step", 1)
@@ -920,9 +940,9 @@ def _param_field_blueprint(
 
     literal_vals = _literal_values(annotation)
     if widget == "enum" and literal_vals:
-        field["values"] = list(literal_vals)
-        if "default" not in field and literal_vals:
-            field["default"] = literal_vals[0]
+        field["values"] = [_json_safe_value(v) for v in literal_vals]
+        if "default" not in field and field["values"]:
+            field["default"] = field["values"][0]
 
     if help_url:
         field["helpUrl"] = help_url

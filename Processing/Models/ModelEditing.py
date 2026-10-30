@@ -363,14 +363,45 @@ def redoModelEdit(view_mode: str = "summary", expanded_nodes: Optional[List[str]
 # Graph reachability / draft node utilities
 # ---------------------------------------------------------------------------
 
+def _explicit_input_ids(descriptor: ArchitectureDescriptor) -> Set[str]:
+    return {n.id for n in descriptor.nodes if n.type.lower() == "input"}
+
+
+def _explicit_output_ids(descriptor: ArchitectureDescriptor) -> Set[str]:
+    return {n.id for n in descriptor.nodes if n.type.lower() == "output"}
+
+
+def _uses_virtual_input(descriptor: ArchitectureDescriptor) -> bool:
+    return any(e.source == "input" or e.target == "input" for e in descriptor.edges)
+
+
+def _uses_virtual_output(descriptor: ArchitectureDescriptor) -> bool:
+    return any(e.source == "output" or e.target == "output" for e in descriptor.edges)
+
+
+def _shows_virtual_input(descriptor: ArchitectureDescriptor) -> bool:
+    """Virtual input is shown when wired, or when no explicit Input nodes exist."""
+    return _uses_virtual_input(descriptor) or not _explicit_input_ids(descriptor)
+
+
+def _shows_virtual_output(descriptor: ArchitectureDescriptor) -> bool:
+    """Virtual output is shown when wired, or when no explicit Output nodes exist."""
+    return _uses_virtual_output(descriptor) or not _explicit_output_ids(descriptor)
+
+
+def _input_role_count(descriptor: ArchitectureDescriptor) -> int:
+    return len(_explicit_input_ids(descriptor)) + (1 if _shows_virtual_input(descriptor) else 0)
+
+
+def _output_role_count(descriptor: ArchitectureDescriptor) -> int:
+    return len(_explicit_output_ids(descriptor)) + (1 if _shows_virtual_output(descriptor) else 0)
+
+
 def _get_input_node_ids(descriptor: ArchitectureDescriptor) -> Set[str]:
-    explicit_inputs = {
-        n.id for n in descriptor.nodes
-        if n.type.lower() == "input"
-    }
-    # Always include the virtual 'input' — it's the canonical graph source
-    explicit_inputs.add("input")
-    return explicit_inputs
+    sources = set(_explicit_input_ids(descriptor))
+    if _shows_virtual_input(descriptor):
+        sources.add("input")
+    return sources
 
 
 def _get_reachable_nodes(descriptor: ArchitectureDescriptor) -> Set[str]:
@@ -780,13 +811,43 @@ class ModelEditEngine:
         if not node_id:
             raise EditError("MISSING_ARGUMENT", "nodeId is required", field="nodeId")
 
-        if node_id in ("input", "output"):
-            raise EditError(
-                "PROTECTED_NODE",
-                f"Cannot remove protected node: {node_id}",
-                field="nodeId",
-                details={"nodeId": node_id},
-            )
+        # Virtual terminals live outside descriptor.nodes. Removable only when
+        # another Input/Output-typed node can take the role (keep ≥1 of each).
+        if node_id == "input":
+            if _input_role_count(descriptor) <= 1:
+                raise EditError(
+                    "PROTECTED_NODE",
+                    "Cannot remove the only input node",
+                    field="nodeId",
+                    details={"nodeId": node_id},
+                )
+            descriptor.edges = [
+                e for e in descriptor.edges
+                if e.source != "input" and e.target != "input"
+            ]
+            return {
+                "success": True,
+                "affected": {"nodeId": node_id},
+                "message": f"Removed virtual node {node_id}",
+            }
+
+        if node_id == "output":
+            if _output_role_count(descriptor) <= 1:
+                raise EditError(
+                    "PROTECTED_NODE",
+                    "Cannot remove the only output node",
+                    field="nodeId",
+                    details={"nodeId": node_id},
+                )
+            descriptor.edges = [
+                e for e in descriptor.edges
+                if e.source != "output" and e.target != "output"
+            ]
+            return {
+                "success": True,
+                "affected": {"nodeId": node_id},
+                "message": f"Removed virtual node {node_id}",
+            }
 
         if not any(n.id == node_id for n in descriptor.nodes):
             raise EditError("NODE_NOT_FOUND", f"Node not found: {node_id}", field="nodeId", details={"nodeId": node_id})

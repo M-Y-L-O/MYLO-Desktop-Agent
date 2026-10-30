@@ -57,16 +57,45 @@ def dummyShapeFromDescriptor(input_shape):
         dummy_shape = [1, 1]
     return dummy_shape
 
+def _shows_virtual_input(descriptor) -> bool:
+    has_explicit = any(n.type.lower() == "input" for n in descriptor.nodes)
+    uses_virtual = any(e.source == "input" or e.target == "input" for e in descriptor.edges)
+    return uses_virtual or not has_explicit
+
+
+def _shows_virtual_output(descriptor) -> bool:
+    has_explicit = any(n.type.lower() == "output" for n in descriptor.nodes)
+    uses_virtual = any(e.source == "output" or e.target == "output" for e in descriptor.edges)
+    return uses_virtual or not has_explicit
+
+
 def descriptorToGraph(descriptor):
-    nodes = [
-        {"id": "input", "label": "input", "title": json.dumps({"shape": descriptor.input_shape}, indent=2), "group": "input"},
-        {"id": "output", "label": "output", "title": json.dumps({"shape": descriptor.output_shape}, indent=2), "group": "output"},
-    ]
+    nodes = []
+    show_input = _shows_virtual_input(descriptor)
+    show_output = _shows_virtual_output(descriptor)
+
+    if show_input:
+        nodes.append({
+            "id": "input",
+            "label": "input",
+            "type": "Input",
+            "title": json.dumps({"shape": descriptor.input_shape}, indent=2),
+            "group": "input",
+        })
+    if show_output:
+        nodes.append({
+            "id": "output",
+            "label": "output",
+            "type": "Output",
+            "title": json.dumps({"shape": descriptor.output_shape}, indent=2),
+            "group": "output",
+        })
 
     for node in descriptor.nodes:
         nodes.append({
             "id": node.id,
             "label": node.id,
+            "type": node.type,
             "title": json.dumps({
                 "type": node.type,
                 "params": node.params,
@@ -81,25 +110,31 @@ def descriptorToGraph(descriptor):
     ]
 
     node_summary = []
-    node_summary.append({
-        "name": "input",
-        "op_type": "Input",
-    })
+    if show_input:
+        node_summary.append({
+            "name": "input",
+            "op_type": "Input",
+        })
     for node in descriptor.nodes:
         node_summary.append({
             "name": node.id if node.id else "Unnamed",
             "op_type": node.type,
         })
-    node_summary.append({
-        "name": "output",
-        "op_type": "Output",
-    })
+    if show_output:
+        node_summary.append({
+            "name": "output",
+            "op_type": "Output",
+        })
 
     summary = {
         "ir_version": None,
         "producer": "descriptor",
-        "inputs": [{"name": "input"}],
-        "outputs": [{"name": "output"}],
+        "inputs": [{"name": "input"}] if show_input else [
+            {"name": n.id} for n in descriptor.nodes if n.type.lower() == "input"
+        ],
+        "outputs": [{"name": "output"}] if show_output else [
+            {"name": n.id} for n in descriptor.nodes if n.type.lower() == "output"
+        ],
         "nodes": node_summary,
         "node_count": len(node_summary),
         "filename": f"{descriptor.model_name}.json" if descriptor.model_name else "descriptor.json",

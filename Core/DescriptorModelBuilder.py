@@ -63,11 +63,22 @@ class DynamicGraphModule(nn.Module):
         return False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Tensors flowing through edges
+        # Tensors flowing through edges. Seed virtual input and any explicit Input nodes.
         outputs = {"input": x}
+        for node in self.descriptor.nodes:
+            if node.type.lower() == "input":
+                outputs[node.id] = x
         hidden_states = {}
 
         for node_id in self.sorted_nodes:
+            node_def = next((n for n in self.descriptor.nodes if n.id == node_id), None)
+            if not node_def:
+                continue
+
+            # Explicit Input nodes already hold the external tensor
+            if node_def.type.lower() == "input":
+                continue
+
             # Collect inputs to this node; skip edges whose source hasn't been computed yet
             node_inputs = []
             for edge in self.descriptor.edges:
@@ -76,10 +87,6 @@ class DynamicGraphModule(nn.Module):
                         node_inputs.append(outputs[edge.source])
 
             if not node_inputs:
-                continue
-
-            node_def = next((n for n in self.descriptor.nodes if n.id == node_id), None)
-            if not node_def:
                 continue
 
             # Merge rule: concat along last dim when multiple inputs arrive
@@ -129,11 +136,15 @@ class DynamicGraphModule(nn.Module):
                 # Virtual nodes (e.g. merge/reshape) pass through
                 outputs[node_id] = in_tensor
 
-        # Find final output
+        # Prefer edges into the virtual output sink, then explicit Output nodes
         final_output_sources = [e.source for e in self.descriptor.edges if e.target == "output"]
         for src in final_output_sources:
             if src in outputs:
                 return outputs[src]
+
+        for node in self.descriptor.nodes:
+            if node.type.lower() == "output" and node.id in outputs:
+                return outputs[node.id]
 
         # Fallback
         for node_id in reversed(self.sorted_nodes):

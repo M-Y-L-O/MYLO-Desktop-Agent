@@ -429,9 +429,11 @@ class MutationGrammar:
         if not node:
             return False
 
-        if node.id in ["input", "output"]:
+        # Virtual terminals are not real descriptor nodes; Input/Output-typed
+        # nodes may be removed (editor keeps ≥1 IO role via virtual fallback).
+        if node.id in ("input", "output"):
             return False
-        
+
         # protected_types = protected_types or set()
         # if node.type in protected_types:
         #     return False

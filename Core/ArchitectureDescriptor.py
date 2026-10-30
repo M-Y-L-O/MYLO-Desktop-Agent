@@ -88,9 +88,25 @@ class ArchitectureDescriptor:
         if visited != len(indegree):
             raise ValueError("Descriptor graph contains cycles")
 
+    def _input_sources(self) -> List[str]:
+        sources = [n.id for n in self.nodes if n.type.lower() == "input"]
+        uses_virtual = any(e.source == "input" or e.target == "input" for e in self.edges)
+        if uses_virtual or not sources:
+            sources = ["input", *sources]
+        return sources
+
+    def _output_sinks(self) -> Set[str]:
+        sinks = {n.id for n in self.nodes if n.type.lower() == "output"}
+        uses_virtual = any(e.source == "output" or e.target == "output" for e in self.edges)
+        if uses_virtual or not sinks:
+            sinks = set(sinks)
+            sinks.add("output")
+        return sinks
+
     def _validate_reachability(self, node_ids: Set[str], strict: bool = True):
-        reachable = {"input"}
-        queue = ["input"]
+        sources = self._input_sources()
+        reachable = set(sources)
+        queue = list(sources)
 
         adjacency: Dict[str, List[str]] = {"input": []}
         for node_id in node_ids:
@@ -106,7 +122,8 @@ class ArchitectureDescriptor:
                     reachable.add(neighbor)
                     queue.append(neighbor)
 
-        if strict and "output" not in reachable:
+        sinks = self._output_sinks()
+        if strict and not (reachable & sinks):
             raise ValueError("Descriptor has no path to output from input")
 
         if strict:
@@ -124,14 +141,29 @@ class ArchitectureDescriptor:
             if edge.target in node_ids:
                 incoming[edge.target].append(edge.source)
 
-        sources_to_output = [edge.source for edge in self.edges if edge.target == "output"]
-        if strict and not sources_to_output:
+        sinks = self._output_sinks()
+        sources_to_output = [
+            edge.source for edge in self.edges
+            if edge.target in sinks
+        ]
+        has_explicit_output = any(n.type.lower() == "output" for n in self.nodes)
+        if strict and not sources_to_output and not has_explicit_output:
             raise ValueError("Descriptor has no path to output sink")
+        if strict and has_explicit_output:
+            # Explicit Output sinks must receive at least one incoming edge
+            for node in self.nodes:
+                if node.type.lower() == "output" and not incoming[node.id]:
+                    raise ValueError(f"Output node has no inputs: {node.id}")
 
+        input_sources = set(self._input_sources())
         for node in self.nodes:
-            if node.type == "Input":
+            if node.type.lower() == "input":
                 continue
-            if not incoming[node.id] and not any(edge.source == "input" and edge.target == node.id for edge in self.edges):
+            fed_by_source = any(
+                edge.source in input_sources and edge.target == node.id
+                for edge in self.edges
+            )
+            if not incoming[node.id] and not fed_by_source:
                 if strict and node.id not in sources_to_output:
                     raise ValueError(f"Dangling node with no inputs: {node.id}")
 
@@ -158,6 +190,7 @@ class ArchitectureDescriptor:
             return
 
         output_sources = [edge.source for edge in self.edges if edge.target == "output"]
+        output_sources.extend(n.id for n in self.nodes if n.type.lower() == "output")
         if output_sources:
             final_shape = shapes.get(output_sources[0])
             if final_shape and not self._shapes_compatible(final_shape, self.output_shape):
@@ -180,6 +213,7 @@ class ArchitectureDescriptor:
             return warnings
 
         output_sources = [edge.source for edge in self.edges if edge.target == "output"]
+        output_sources.extend(n.id for n in self.nodes if n.type.lower() == "output")
         if output_sources:
             final_shape = shapes.get(output_sources[0])
             if final_shape and not self._shapes_compatible(final_shape, self.output_shape):
@@ -207,6 +241,9 @@ class ArchitectureDescriptor:
         warnings: Optional[List[str]] = None,
     ) -> Dict[str, List[int]]:
         shapes: Dict[str, List[int]] = {"input": list(self.input_shape)}
+        for node in self.nodes:
+            if node.type.lower() == "input":
+                shapes[node.id] = list(self.input_shape)
         try:
             sorted_nodes = self._topological_node_order()
         except Exception as e:
@@ -224,6 +261,8 @@ class ArchitectureDescriptor:
 
         for node_id in sorted_nodes:
             node = next(n for n in self.nodes if n.id == node_id)
+            if node.type.lower() == "input":
+                continue
             input_shapes = self._collect_input_shapes(node_id, shapes)
             if not input_shapes:
                 continue
@@ -235,30 +274,32 @@ class ArchitectureDescriptor:
                     else self._merge_shapes(input_shapes, node, strict=strict, warnings=warnings)
                 )
                 in_features = self._infer_in_features(node, in_shape)
+                # Dynamic dims (-1) are not concrete sizes — never clobber user params with them.
+                can_propagate = isinstance(in_features, int) and in_features > 0
 
                 if node.type == "Linear":
                     expected = node.params.get("in_features")
-                    if expected is not None and expected != in_features and not mutate:
+                    if expected is not None and can_propagate and expected != in_features and not mutate:
                         _note(f"Linear node {node.id} expects in_features={expected}, got {in_features}")
-                    if mutate:
+                    if mutate and can_propagate:
                         node.params["in_features"] = in_features
                 elif node.type in ("Conv1d", "Conv2d", "ConvTranspose1d", "ConvTranspose2d"):
                     expected = node.params.get("in_channels")
-                    if expected is not None and expected != in_features and not mutate:
+                    if expected is not None and can_propagate and expected != in_features and not mutate:
                         _note(f"{node.type} node {node.id} expects in_channels={expected}, got {in_features}")
-                    if mutate:
+                    if mutate and can_propagate:
                         node.params["in_channels"] = in_features
                 elif node.type in ("LSTM", "GRU"):
                     expected = node.params.get("input_size")
-                    if expected is not None and expected != in_features and not mutate:
+                    if expected is not None and can_propagate and expected != in_features and not mutate:
                         _note(f"{node.type} node {node.id} expects input_size={expected}, got {in_features}")
-                    if mutate:
+                    if mutate and can_propagate:
                         node.params["input_size"] = in_features
                 elif node.type in ("BatchNorm1d", "BatchNorm2d"):
                     expected = node.params.get("num_features")
-                    if expected is not None and expected != in_features and not mutate:
+                    if expected is not None and can_propagate and expected != in_features and not mutate:
                         _note(f"{node.type} node {node.id} expects num_features={expected}, got {in_features}")
-                    if mutate:
+                    if mutate and can_propagate:
                         node.params["num_features"] = in_features
 
                 out_shape = self._infer_output_shape(node, in_shape)
