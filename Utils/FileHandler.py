@@ -1,44 +1,40 @@
 import os
-import pandas as pd
-
-from fastapi.params import File
 import tempfile
 
-def loadModel(path:str):
-    if os.path.exists(path):
-        with open(path, 'r') as file:
-            binary_data = file.read()
-            return binary_data
-    else:
-        raise FileNotFoundError("Model file not found")
-    
-async def saveFile(file:File, path:str = "temp_project"):
-    tempPath = os.path.join(path, file.filename)
+import pandas as pd
+
+
+async def saveFile(file, path: str = "temp_project"):
+    filename = os.path.basename(str(file.filename or "").replace("\\", "/"))
+    if not filename:
+        raise ValueError("Uploaded file must have a filename")
+
+    os.makedirs(path, exist_ok=True)
+    tempPath = os.path.join(path, filename)
 
     with open(tempPath, "wb") as f:
         while True:
-            chunk = await file.read(1024*1024)
+            chunk = await file.read(1024 * 1024)
             if not chunk:
                 break
             f.write(chunk)
-            
+
     return tempPath
 
-def loadData(path:str):
+
+def loadData(path: str):
     if os.path.exists(path):
         return pd.read_csv(path)
-    else:
-        raise FileNotFoundError("Data file not found")
-    
-def readBinary(path:str):
+    raise FileNotFoundError("Data file not found")
+
+
+def readBinary(path: str):
     if os.path.exists(path):
-        with open(path, 'rb') as file:
-            binary_data = file.read()
-            return binary_data
-        
+        with open(path, "rb") as file:
+            return file.read()
+
+
 def createTempFile(fileBytes, extension):
-  with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_file:
-    temp_file.write(fileBytes)
-    temp_file_path = temp_file.name
-  
-  return temp_file_path
+    with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_file:
+        temp_file.write(fileBytes)
+        return temp_file.name

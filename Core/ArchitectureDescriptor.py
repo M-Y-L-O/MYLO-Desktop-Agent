@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Any, Optional, Set, Tuple
+from typing import Any, Dict, List, Set
 
 
 @dataclass

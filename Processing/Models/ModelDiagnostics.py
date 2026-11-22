@@ -144,6 +144,9 @@ def _load_weights_if_available(model: torch.nn.Module, weights_path: str) -> Dic
                 "matched_key_count": len(transfer_report.get("matched_keys", [])),
                 "unmatched_source_count": len(transfer_report.get("unmatched_source", [])),
                 "unmatched_target_count": len(transfer_report.get("unmatched_target", [])),
+                "mapping_summary": transfer_report.get("mapping_summary", {}),
+                "parameter_mappings": transfer_report.get("parameter_mappings", []),
+                "mapping_warnings": transfer_report.get("mapping_warnings", []),
             }
         )
     except Exception as exc:
@@ -857,6 +860,22 @@ def _detect_warnings(
                     },
                     suggestion="Architecture and weights are not fully compatible — some parameters will stay at their initial values.",
                 )
+            mapping_summary = weights_report.get("mapping_summary", {})
+            overlap_count = mapping_summary.get("overlap_tensor_count", 0)
+            if overlap_count:
+                _add(
+                    "medium",
+                    "partial_weight_transfer",
+                    f"Weight transfer used overlap copying for {overlap_count} tensors.",
+                    details={
+                        "mapping_summary": mapping_summary,
+                        "mapping_warnings": weights_report.get("mapping_warnings", []),
+                    },
+                    suggestion=(
+                        "Treat the edited model as an approximate warm start; overlap "
+                        "copying does not guarantee function preservation."
+                    ),
+                )
 
 
     if onnx_report.get("requested") and not onnx_report.get("exported", False):
@@ -1089,7 +1108,11 @@ def _retrain_and_validate(
     problem_type: str,
     batch_size: int,
     validation_split: float,
+    test_split: float,
     learning_rate: float,
+    random_state: int,
+    encoding: str,
+    early_stopping_patience: int,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     if not csv_path:
         raise ValueError("csv_path is required when mode='retrain'")
@@ -1105,6 +1128,8 @@ def _retrain_and_validate(
         raise ValueError("validation_split must be between 0 and 1")
     if learning_rate <= 0:
         raise ValueError("learning_rate must be greater than 0")
+    if early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be at least 1")
 
     sequence_length = descriptor.input_shape[1] if len(descriptor.input_shape) == 3 else None
     pipeline = DataPipeline.prepare_data(
@@ -1114,7 +1139,10 @@ def _retrain_and_validate(
         problem_type=problem_type,
         batch_size=batch_size,
         val_split=validation_split,
+        test_split=test_split,
         sequence_length=sequence_length,
+        random_state=random_state,
+        encoding=encoding,
     )
     if descriptor.input_shape[-1] != pipeline.input_shape[-1]:
         raise ValueError(
@@ -1138,6 +1166,10 @@ def _retrain_and_validate(
     )
     history: List[Dict[str, Any]] = []
     started = time.perf_counter()
+    best_validation_loss = float("inf")
+    best_epoch = 0
+    best_state = copy.deepcopy(model.state_dict())
+    epochs_without_improvement = 0
 
     for epoch_index in range(epochs):
         model.train()
@@ -1167,6 +1199,10 @@ def _retrain_and_validate(
         validation = _evaluate_dataset(
             model, pipeline.val_loader, criterion, device, problem_type, target_scaler
         )
+        if not math.isfinite(float(validation["loss"])):
+            raise RuntimeError(
+                f"Non-finite validation loss encountered at epoch {epoch_index + 1}"
+            )
         history.append({
             "epoch": epoch_index + 1,
             "train_loss": round(loss_sum / max(sample_count, 1), 8),
@@ -1175,9 +1211,27 @@ def _retrain_and_validate(
             "learning_rate": learning_rate,
             "duration_ms": round((time.perf_counter() - epoch_started) * 1000.0, 4),
         })
+        current_validation_loss = float(validation["loss"])
+        if current_validation_loss < best_validation_loss - 1e-10:
+            best_validation_loss = current_validation_loss
+            best_epoch = epoch_index + 1
+            best_state = copy.deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= early_stopping_patience:
+                break
 
+    model.load_state_dict(best_state)
     final_validation = _evaluate_dataset(
         model, pipeline.val_loader, criterion, device, problem_type, target_scaler
+    )
+    held_out_test = (
+        _evaluate_dataset(
+            model, pipeline.test_loader, criterion, device, problem_type, target_scaler
+        )
+        if pipeline.test_loader is not None
+        else None
     )
     elapsed = time.perf_counter() - started
     baseline_loss = baseline.get("loss")
@@ -1191,6 +1245,9 @@ def _retrain_and_validate(
         "device": str(device),
         "epochs_requested": epochs,
         "epochs_completed": len(history),
+        "best_epoch": best_epoch,
+        "early_stopped": len(history) < epochs,
+        "early_stopping_patience": early_stopping_patience,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "duration_seconds": round(elapsed, 4),
@@ -1199,6 +1256,9 @@ def _retrain_and_validate(
     validation = {
         "problem_type": problem_type,
         "split": validation_split,
+        "test_split": test_split,
+        "split_protocol": pipeline.split_metadata,
+        "preprocessing": pipeline.preprocessing_metadata(),
         "metric_scale": (
             "original_target_units" if problem_type == "regression" else "class_indices"
         ),
@@ -1207,6 +1267,7 @@ def _retrain_and_validate(
         ),
         "baseline": baseline,
         "final": final_validation,
+        "held_out_test": held_out_test,
         "loss_improvement_percent": round(improvement_pct, 6) if improvement_pct is not None else None,
     }
     return training, validation
@@ -1230,7 +1291,11 @@ def generateModelDiagnostics(
     problem_type: str = "regression",
     batch_size: int = 32,
     validation_split: float = 0.2,
+    test_split: float = 0.1,
     learning_rate: float = 1e-3,
+    random_state: int = 42,
+    encoding: str = "none",
+    early_stopping_patience: int = 5,
 ) -> Dict[str, Any]:
     mode = str(mode or "dummy").strip().lower()
     if mode not in ("dummy", "retrain"):
@@ -1249,7 +1314,10 @@ def generateModelDiagnostics(
     epochs = int(epochs)
     batch_size = int(batch_size)
     validation_split = float(validation_split)
+    test_split = float(test_split)
     learning_rate = float(learning_rate)
+    random_state = int(random_state)
+    early_stopping_patience = int(early_stopping_patience)
     descriptor_copy = copy.deepcopy(descriptor)
     descriptor_copy.normalize_inplace()
     descriptor_copy.validate()
@@ -1381,7 +1449,11 @@ def generateModelDiagnostics(
             problem_type=problem_type,
             batch_size=batch_size,
             validation_split=validation_split,
+            test_split=test_split,
             learning_rate=learning_rate,
+            random_state=random_state,
+            encoding=encoding,
+            early_stopping_patience=early_stopping_patience,
         )
         validation_metrics["available"] = True
 
@@ -1527,6 +1599,9 @@ def generateModelDiagnostics(
             "matched_key_count": weights_report.get("matched_key_count", 0),
             "unmatched_source_count": weights_report.get("unmatched_source_count", 0),
             "unmatched_target_count": weights_report.get("unmatched_target_count", 0),
+            "mapping_summary": weights_report.get("mapping_summary", {}),
+            "parameter_mappings": weights_report.get("parameter_mappings", []),
+            "mapping_warnings": weights_report.get("mapping_warnings", []),
             "error": weights_report.get("error"),
         },
         "onnx": {

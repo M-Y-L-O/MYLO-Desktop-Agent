@@ -2,12 +2,11 @@ import copy
 import json
 import random
 import os
-import tempfile
 import logging
 import math
 import traceback
 from typing import List, Dict, Any, Tuple, Optional, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import time

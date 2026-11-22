@@ -5,6 +5,12 @@ __pycache__/
 *.pyc
 temp_project/
 temp_export/
+tmp/
 .git/
 .venv/
 venv/
+.env
+.env.*
+.vscode/
+current_session.json
+pyvenv.cfg

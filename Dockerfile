@@ -14,7 +14,6 @@ COPY Core ./Core
 COPY Processing ./Processing
 COPY Types ./Types
 COPY Utils ./Utils
-COPY .env .
 
 ENV SERVER_IP=0.0.0.0
 ENV SERVER_PORT=8080
@@ -22,5 +21,3 @@ ENV SERVER_PORT=8080
 EXPOSE 8080
 
 CMD ["python", "App.py"]
-
-# docker build -t mylo-agent:local .

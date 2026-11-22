@@ -4,7 +4,7 @@ from typing import Dict, Any, List, Tuple
 from Utils.Other import make_json_serializable
 import logging
 from scipy import stats
-from scipy.stats import shapiro, normaltest
+from scipy.stats import shapiro
 
 logger = logging.getLogger(__name__)
 

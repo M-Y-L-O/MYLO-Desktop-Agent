@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import tempfile
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 import torch
 

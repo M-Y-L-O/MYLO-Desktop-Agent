@@ -1,7 +1,5 @@
 import logging
 import onnx
-import torch
-import os
 
 def analyseOnnx(file_path:str):
     try:

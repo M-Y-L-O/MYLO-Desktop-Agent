@@ -4,7 +4,7 @@ import copy
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -18,7 +18,6 @@ try:
         MedianPruner,
         NopPruner,
         SuccessiveHalvingPruner,
-        ThresholdPruner,
     )
     from optuna.samplers import (
         CmaEsSampler,
@@ -31,7 +30,7 @@ try:
 except ImportError:  # pragma: no cover
     OPTUNA_AVAILABLE = False
 
-from Core.ArchitectureDescriptor import ArchitectureDescriptor, Node, Edge
+from Core.ArchitectureDescriptor import ArchitectureDescriptor, Node
 from Core.DescriptorModelBuilder import DescriptorModelBuilder
 from Core.WeightCompatibilityEngine import WeightCompatibilityEngine
 from Processing.Optimization.Neuroevolution import (

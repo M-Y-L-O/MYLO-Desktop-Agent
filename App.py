@@ -1,11 +1,12 @@
 import asyncio
-import os
 import json
+import logging
+import os
 import shutil
 from typing import Optional
 from zipfile import ZipFile, ZIP_DEFLATED
 
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import Body, FastAPI, File, Header, Request, UploadFile
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -14,7 +15,17 @@ import uvicorn
 import pandas as pd
 
 from Processing.Optimization.Optimizing import startOptimization
-from Types.Types import *
+from Processing.Optimization.TransitionService import (
+    ResearchExperimentError,
+    discover_linear_width_candidates,
+    list_research_runs,
+    load_research_run,
+    research_api_enabled,
+    research_status,
+    run_project_linear_width_benchmark,
+    run_project_linear_width_experiment,
+)
+from Types.Types import OptimizationRequest, ProjectData, SessionData
 from Processing.Models.ModelProcessing import analyseModel
 from Processing.Models.ModelDiagnostics import generateModelDiagnostics
 from Processing.Models.ModelEditing import (
@@ -31,7 +42,6 @@ from Processing.Models.ModelEditing import (
     exportUploadedPt2ToOnnx,
     _ProjectHistory,
     _get_draft_node_ids,
-    _get_reachable_nodes,
 )
 from Processing.Models.node_catalog import get_catalog, TEMPLATES
 from Processing.Data.DataProcessingForVisualisation import (
@@ -47,6 +57,8 @@ from Utils.FileHandler import saveFile
 from Utils.Other import make_json_serializable
 
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------- GLOBAL STATE ----------------
 
@@ -55,7 +67,14 @@ CurrentProject = ProjectData()
 queue = []
 optimizing = False
 
-MIDDLEWARE_EXCEPTIONS = ["/", "/initialize", "/docs", "/openapi.json", "/optimizationStatus"]
+MIDDLEWARE_EXCEPTIONS = [
+    "/",
+    "/initialize",
+    "/docs",
+    "/openapi.json",
+    "/optimizationStatus",
+    "/research/status",
+]
 
 REPORT_FILENAME = "optimization_report.json"
 
@@ -67,13 +86,22 @@ load_dotenv()
 
 app = FastAPI(title="MYLO AGENT", version="0.3.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+def _cors_origins() -> list[str]:
+    """Return the web origins allowed to call the loopback agent."""
+    raw = os.getenv("CORS_ORIGINS", "").strip()
+    if raw:
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return ["http://localhost:3000", "http://127.0.0.1:3000"]
+
+
+@app.middleware("http")
+async def allow_private_network(request: Request, call_next):
+    """Allow an HTTPS web app to complete a preflight to the local agent."""
+    response = await call_next(request)
+    if request.headers.get("access-control-request-private-network") == "true":
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
 
 
 
@@ -157,10 +185,9 @@ def cleanup_existing_source_models(extension: str):
             os.remove(full_path)
 
 
-async def save_uploaded_to_slot(file: UploadFile, previous_filename: str = ""):
-    temp_path = await saveFile(file, path="temp_project")
-    target_filename = os.path.basename(file.filename or "")
-    return target_filename
+async def save_uploaded_to_slot(file: UploadFile):
+    saved_path = await saveFile(file, path="temp_project")
+    return os.path.basename(saved_path)
 
 
 def loadProjectData():
@@ -227,6 +254,17 @@ async def checkRequest(request: Request, call_next):
             return JSONResponse({"error": "Invalid API key"}, 401)
 
     return await call_next(request)
+
+
+# Register CORS last so authentication and preflight responses also receive
+# the browser access headers.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------- SESSION ----------------
@@ -314,7 +352,7 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
             if previous_slot_filename == target_name and slot_exists(previous_slot_filename):
                 replaced_backup = project_path(f".{target_name}.upload-backup")
                 shutil.copy2(project_path(previous_slot_filename), replaced_backup)
-            model_name = await save_uploaded_to_slot(file, CurrentProject.uploadedPt2Filepath)
+            model_name = await save_uploaded_to_slot(file)
             saved_paths.append(project_path(model_name))
             CurrentProject.uploadedPt2Filepath = model_name
             CurrentProject.modelFilepath = model_name
@@ -324,7 +362,7 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
             if previous_slot_filename == target_name and slot_exists(previous_slot_filename):
                 replaced_backup = project_path(f".{target_name}.upload-backup")
                 shutil.copy2(project_path(previous_slot_filename), replaced_backup)
-            model_name = await save_uploaded_to_slot(file, CurrentProject.uploadedOnnxFilepath)
+            model_name = await save_uploaded_to_slot(file)
             saved_paths.append(project_path(model_name))
             CurrentProject.uploadedOnnxFilepath = model_name
         else:
@@ -402,9 +440,9 @@ async def loadModel(file: UploadFile = File(...), weightsFile: Optional[UploadFi
         if "rollback_upload" in locals():
             try:
                 rollback_upload()
-            except Exception as rollback_error:
-                print(f"Error rolling back model upload: {rollback_error}")
-        print(f"Error in /loadModel: {e}")
+            except Exception:
+                logger.exception("Failed to roll back model upload")
+        logger.exception("Model upload failed")
         return JSONResponse({"error": str(e)}, 500)
 
 
@@ -511,7 +549,11 @@ async def modelDiagnostics(request: Request):
             problem_type=body.get("problemType", "regression"),
             batch_size=body.get("batchSize", 32),
             validation_split=body.get("validationSplit", 0.2),
+            test_split=body.get("testSplit", 0.1),
             learning_rate=body.get("learningRate", 0.001),
+            random_state=body.get("randomState", 42),
+            encoding=body.get("encoding", "none"),
+            early_stopping_patience=body.get("earlyStoppingPatience", 5),
         )
         return JSONResponse(result)
     except Exception as e:
@@ -928,6 +970,157 @@ async def getTargetAnalysis(request: Request):
 
 # ---------------- OPTIMIZATION ----------------
 
+@app.get("/research/status")
+async def researchStatus():
+    return JSONResponse(research_status())
+
+
+@app.get("/research/linearWidthCandidates")
+async def researchLinearWidthCandidates():
+    if not research_api_enabled():
+        return JSONResponse(research_status(), 403)
+    loadProjectData()
+    try:
+        result = discover_linear_width_candidates(CurrentProject)
+        return JSONResponse(make_json_serializable(result))
+    except ResearchExperimentError as exc:
+        return JSONResponse(make_json_serializable(exc.to_dict()), 400)
+
+
+@app.get("/research/runs")
+async def researchRuns():
+    loadProjectData()
+    return JSONResponse(make_json_serializable({"runs": list_research_runs(CurrentProject)}))
+
+
+@app.get("/research/runs/{run_id}")
+async def researchRun(run_id: str):
+    loadProjectData()
+    try:
+        return JSONResponse(
+            make_json_serializable(load_research_run(run_id, project=CurrentProject))
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, 400)
+    except FileNotFoundError as exc:
+        return JSONResponse({"error": str(exc)}, 404)
+
+
+@app.post("/research/linearWidthExperiment")
+async def researchLinearWidthExperiment(
+    body: dict = Body(
+        ...,
+        openapi_examples={
+            "widen": {
+                "summary": "Evidence-guided widening experiment",
+                "value": {
+                    "nodeId": "dense1",
+                    "newWidth": 96,
+                    "inputFeatures": ["feature_1", "feature_2"],
+                    "targetFeatures": ["target"],
+                    "problemType": "regression",
+                    "decisionMode": "execution_evidence",
+                    "maxSteps": 25,
+                    "earlyStoppingPatienceEvaluations": 3,
+                    "minimumRelativeImprovement": 0.0001,
+                    "validationSplit": 0.2,
+                    "testSplit": 0.1,
+                    "randomState": 42,
+                    "seed": 7,
+                },
+            }
+        },
+    ),
+    _authorization: Optional[str] = Header(default=None, alias="Authorization"),
+):
+    global optimizing
+    if not research_api_enabled():
+        return JSONResponse(research_status(), 403)
+    if optimizing:
+        return JSONResponse({"error": "Another optimization is already running"}, 409)
+
+    loadProjectData()
+    optimizing = True
+    try:
+        result = await asyncio.to_thread(
+            run_project_linear_width_experiment,
+            CurrentProject,
+            body,
+        )
+        return JSONResponse(make_json_serializable(result))
+    except ResearchExperimentError as exc:
+        return JSONResponse(make_json_serializable(exc.to_dict()), 400)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, 400)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"Research experiment failed: {type(exc).__name__}: {exc}"},
+            500,
+        )
+    finally:
+        optimizing = False
+
+
+@app.post("/research/linearWidthBenchmark")
+async def researchLinearWidthBenchmark(
+    body: dict = Body(
+        ...,
+        openapi_examples={
+            "paired": {
+                "summary": "Paired evidence-vs-always-train benchmark",
+                "value": {
+                    "candidates": [
+                        {"nodeId": "dense1", "newWidth": 32},
+                        {"nodeId": "dense1", "newWidth": 48},
+                        {"nodeId": "dense1", "newWidth": 96},
+                    ],
+                    "decisionModes": ["execution_evidence", "static_only", "always_train"],
+                    "inputFeatures": ["feature_1", "feature_2"],
+                    "targetFeatures": ["target"],
+                    "problemType": "regression",
+                    "stepsPerCandidate": 20,
+                    "optimizerStepBudget": 60,
+                    "earlyStoppingPatienceEvaluations": 3,
+                    "minimumRelativeImprovement": 0.0001,
+                    "maxValidationLossRatio": 2.0,
+                    "testEvaluationScope": "none",
+                    "validationSplit": 0.2,
+                    "testSplit": 0.1,
+                    "randomState": 42,
+                    "seed": 7,
+                },
+            }
+        },
+    ),
+    _authorization: Optional[str] = Header(default=None, alias="Authorization"),
+):
+    global optimizing
+    if not research_api_enabled():
+        return JSONResponse(research_status(), 403)
+    if optimizing:
+        return JSONResponse({"error": "Another optimization is already running"}, 409)
+
+    loadProjectData()
+    optimizing = True
+    try:
+        result = await asyncio.to_thread(
+            run_project_linear_width_benchmark,
+            CurrentProject,
+            body,
+        )
+        return JSONResponse(make_json_serializable(result))
+    except ResearchExperimentError as exc:
+        return JSONResponse(make_json_serializable(exc.to_dict()), 400)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, 400)
+    except Exception as exc:
+        return JSONResponse(
+            {"error": f"Research benchmark failed: {type(exc).__name__}: {exc}"},
+            500,
+        )
+    finally:
+        optimizing = False
+
 @app.post("/optimizeModel")
 async def optimizeModel(request: Request):
     global CurrentProject, queue, optimizing
@@ -948,6 +1141,9 @@ async def optimizeModel(request: Request):
     strategy = body.get("strategy", "brute-force")
     generations = body.get("generations", 5)
     problemType = body.get("problemType", "regression")
+    validationSplit = body.get("validationSplit", 0.2)
+    testSplit = body.get("testSplit", 0.1)
+    randomState = body.get("randomState", 42)
 
     if requestedModelFile:
         requested_model_path = project_path(requestedModelFile)
@@ -974,7 +1170,10 @@ async def optimizeModel(request: Request):
                 targetFeature=targetFeature,
                 epochs=epochs,
                 generations=generations,
-                problemType=problemType
+                problemType=problemType,
+                validationSplit=validationSplit,
+                testSplit=testSplit,
+                randomState=randomState,
             ),
             callback
         )
@@ -982,7 +1181,6 @@ async def optimizeModel(request: Request):
         result = {"error": str(e)}
         queue.append({"type": "error", "status": f"Error: {e}", "error": True, "progress": 0})
     finally:
-        # Always release the global lock, even if the optimizer blew up.
         optimizing = False
 
     if isinstance(result, dict) and result.get("status") == "success":

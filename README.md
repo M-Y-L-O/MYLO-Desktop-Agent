@@ -1,1 +1,1 @@
-# MYLO Desktop Agent
+MYLO

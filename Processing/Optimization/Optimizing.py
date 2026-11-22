@@ -1,20 +1,23 @@
-from Processing.Optimization.Neuroevolution import NeuroevolutionEngine
+from Processing.Optimization.Neuroevolution import NeuroevolutionEngine, TieredEvaluator
+from Processing.Optimization.RecoveryHarness import TransitionRecoveryHarness
 from Processing.Optimization.OptunaSearch import OptunaSearchEngine
 from Types.Types import ProjectData, OptimizationRequest
 from Utils.FileHandler import loadData, readBinary
 from Utils.Other import getDevice
 import asyncio
+import copy
 import concurrent.futures
-from Processing.Data.DataProcessingForTraining import encodeData, mapOriginalToEncodedColumns
 import torch
 from Processing.Models.ModelEditing import loadProjectDescriptor
 from Processing.Data.DataPipeline import DataPipeline
-from Processing.Models.DescriptorHandling import loadDescriptorFromBytes, descriptorToOnnx, extractStateDict
+from Processing.Models.DescriptorHandling import descriptorToOnnx, extractStateDict
 import os
 import json
 import logging
 
 from Core.AdaptedModel import AdaptedModel
+from Core.DescriptorModelBuilder import DescriptorModelBuilder
+from Core.WeightCompatibilityEngine import WeightCompatibilityEngine
 
 logger = logging.getLogger(__name__)
 
@@ -256,7 +259,6 @@ def _build_engine(strategy, initial_descriptor, requestInfo, statusCallback):
 
 async def startOptimization(project: ProjectData, requestInfo: OptimizationRequest, statusCallback):
     statusCallback = statusCallback or (lambda *_args, **_kwargs: None)
-    print(requestInfo)
 
     if not project.csvFilepath:
         return {"error": "CSV file is missing from the current project"}
@@ -276,18 +278,10 @@ async def startOptimization(project: ProjectData, requestInfo: OptimizationReque
     statusCallback({"type": "phase", "phase": "processing", "status": "Processing request...", "progress": 0})
     data = loadData(csv_path)
 
-    statusCallback({"type": "phase", "phase": "encoding", "status": "Encoding data...", "progress": 5})
-    result = encodeData(data, requestInfo.encoding)
-    encodedDf = result[0]
-    encodedMetadata = result[1]
-
     targetFeature = requestInfo.targetFeature if isinstance(requestInfo.targetFeature, list) else [requestInfo.targetFeature]
-    mappedInputFeatures = mapOriginalToEncodedColumns(requestInfo.inputFeatures, encodedMetadata, encodedDf)
-    mappedTargetFeature = mapOriginalToEncodedColumns(targetFeature, encodedMetadata, encodedDf)
 
     statusCallback({"type": "phase", "phase": "loading_model", "status": "Loading model...", "progress": 10})
-    requestInfo.inputFeatures = mappedInputFeatures
-    requestInfo.targetFeature = mappedTargetFeature
+    requestInfo.targetFeature = targetFeature
 
     isPytorchModel = model_path.lower().endswith((".pt", ".pth", ".pt2", ".ptpkg", ".torchpackage"))
 
@@ -305,7 +299,7 @@ async def startOptimization(project: ProjectData, requestInfo: OptimizationReque
             pool,
             lambda: findOptimalArchitecture(
                 project,
-                encodedDf,
+                data,
                 requestInfo,
                 isPytorchModel,
                 statusCallback=statusCallback,
@@ -362,12 +356,16 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
         batch_size = _suggest_batch_size(device, len(df), initialDescriptor)
 
         pipeline = DataPipeline.prepare_data(
-            _temp_project_path(project.csvFilepath),
+            df,
             featureCols,
             targetCol,
             problem_type=problem_type,
             batch_size=batch_size,
+            val_split=float(getattr(requestInfo, "validation_split", 0.2)),
+            test_split=float(getattr(requestInfo, "test_split", 0.1)),
             sequence_length=sequence_length,
+            random_state=int(getattr(requestInfo, "random_state", 42)),
+            encoding=getattr(requestInfo, "encoding", "none"),
         )
 
         _adapt_descriptor_to_data_shapes(
@@ -375,6 +373,16 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             pipeline.input_shape,
             pipeline.output_shape,
         )
+
+        baseline_model = None
+        baseline_mapping = None
+        if parent_state_dict:
+            baseline_model = DescriptorModelBuilder.build(copy.deepcopy(initialDescriptor))
+            baseline_mapping = WeightCompatibilityEngine.transfer_weights(
+                parent_state_dict,
+                baseline_model,
+                allow_ambiguous_key_mapping=False,
+            )
 
         original_descriptor_dict = initialDescriptor.to_dict()
 
@@ -394,6 +402,48 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             parent_state_dict=parent_state_dict,
             problem_type=problem_type,
         )
+
+        held_out_test = None
+        if pipeline.test_loader is not None:
+            criterion = TieredEvaluator.select_criterion(problem_type).to(device)
+            best_model.to(device)
+            champion_loss, champion_accuracy = TransitionRecoveryHarness.evaluate(
+                best_model,
+                pipeline.test_loader,
+                criterion,
+                device,
+            )
+            held_out_test = {
+                "champion_loss": champion_loss,
+                "champion_accuracy": champion_accuracy,
+                "used_for_selection": False,
+                "loss_scale": (
+                    "standardized_targets"
+                    if problem_type == "regression"
+                    else "cross_entropy"
+                ),
+            }
+            if baseline_model is not None:
+                baseline_model.to(device)
+                baseline_loss, baseline_accuracy = TransitionRecoveryHarness.evaluate(
+                    baseline_model,
+                    pipeline.test_loader,
+                    criterion,
+                    device,
+                )
+                held_out_test.update(
+                    {
+                        "baseline_loss": baseline_loss,
+                        "baseline_accuracy": baseline_accuracy,
+                        "loss_delta": champion_loss - baseline_loss,
+                        "loss_improvement_percent": (
+                            (baseline_loss - champion_loss)
+                            / max(abs(baseline_loss), 1e-12)
+                            * 100.0
+                        ),
+                        "baseline_mapping": baseline_mapping.get("mapping_summary", {}),
+                    }
+                )
 
         expected_input = best_descriptor.input_shape[-1]
         actual_input = pipeline.input_shape[-1]
@@ -429,6 +479,7 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             {
                 "state_dict": best_model.state_dict(),
                 "model_config": best_descriptor.to_dict(),
+                "preprocessing": pipeline.preprocessing_metadata(),
             },
             weights_path,
         )
@@ -437,6 +488,7 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             {
                 "state_dict": best_model.state_dict(),
                 "model_config": best_descriptor.to_dict(),
+                "preprocessing": pipeline.preprocessing_metadata(),
             },
             bundle_path,
         )
@@ -456,11 +508,15 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             "strategy_used": strategy,
             "requested_strategy": getattr(requestInfo, "strategy", None),
             "input_features": featureCols,
+            "transformed_input_features": pipeline.feature_names,
             "output_features": targetCol,
+            "data_split": pipeline.split_metadata,
         }
         summary.update(build_summary(diagnostics))
 
         diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+        diagnostics["held_out_test"] = held_out_test
+        diagnostics["data_split"] = pipeline.split_metadata
 
         result = {
             "status": "success",
@@ -480,6 +536,8 @@ def findOptimalArchitecture(project: ProjectData, df, requestInfo: OptimizationR
             "champion_lineage": diagnostics.get("champion_lineage"),
             "training_history": diagnostics.get("champion_training"),
             "mutation_timeline": diagnostics.get("mutation_timeline"),
+            "held_out_test": held_out_test,
+            "preprocessing": pipeline.preprocessing_metadata(),
         }
 
         report_path = os.path.join(output_dir, REPORT_FILENAME)

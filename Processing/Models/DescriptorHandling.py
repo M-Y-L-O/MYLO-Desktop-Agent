@@ -43,7 +43,7 @@ def descriptorToOnnx(model, descriptor, outputPath, device=None):
         raise FileNotFoundError(f"ONNX export reported success but file missing: {outputPath}")
 
     onnx.checker.check_model(outputPath)
-    print(f"ONNX model exported to {outputPath}")
+    logging.info("ONNX model exported to %s", outputPath)
     return outputPath
 
 def dummyShapeFromDescriptor(input_shape):

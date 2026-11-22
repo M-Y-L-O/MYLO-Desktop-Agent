@@ -1,4 +1,3 @@
-import json
 from Processing.Models.ModelEditing import ModelEditEngine
 
 # Grouping of node types for UI catalogs

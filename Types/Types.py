@@ -1,23 +1,14 @@
 import json
+import os
 
 
 class SessionData:
-    apiKey=""
-    initialized=False
-
     def __init__(self):
-        pass
+        self.apiKey = ""
+        self.initialized = False
+
 
 class ProjectData:
-    csvFilepath=""
-    modelFilepath=""
-    name=""
-    id=""
-    uploadedPt2Filepath=""
-    uploadedOnnxFilepath=""
-    optimizedPt2Filepath=""
-    optimizedOnnxFilepath=""
-
     def dumpInTemp(self):
         data = {
             "csvFilepath": self.csvFilepath,
@@ -28,11 +19,11 @@ class ProjectData:
             "optimizedPt2Filepath": self.optimizedPt2Filepath,
             "optimizedOnnxFilepath": self.optimizedOnnxFilepath,
             "name": self.name,
-            "id":self.id
+            "id": self.id,
         }
-        
-        print("Dumping project data to temp:", data)
-        with open("temp_project/projectInfo.json", "w") as f:
+
+        os.makedirs("temp_project", exist_ok=True)
+        with open("temp_project/projectInfo.json", "w", encoding="utf-8") as f:
             json.dump(data, f)
 
     def __init__(self):
@@ -46,19 +37,29 @@ class ProjectData:
         self.name = ""
         self.id = ""
 
-class OptimizationRequest:
-    encoding = ""
-    strategy = ""
-    inputFeatures = []
-    targetFeature = []
-    epochs = 0
-    generations = 5
-    problem_type = "regression" 
 
-    def __init__(self, encoding="", strategy="", inputFeatures=None, targetFeature=None, epochs=0, generations=5, problem_type="regression", problemType="regression"):
+class OptimizationRequest:
+    def __init__(
+        self,
+        encoding="",
+        strategy="",
+        inputFeatures=None,
+        targetFeature=None,
+        epochs=0,
+        generations=5,
+        problem_type="regression",
+        problemType=None,
+        validationSplit=0.2,
+        testSplit=0.1,
+        randomState=42,
+    ):
         self.encoding = encoding
         self.strategy = strategy
         self.inputFeatures = inputFeatures if inputFeatures is not None else []
         self.targetFeature = targetFeature if targetFeature is not None else []
         self.epochs = epochs
         self.generations = generations
+        self.problem_type = problemType or problem_type or "regression"
+        self.validation_split = validationSplit
+        self.test_split = testSplit
+        self.random_state = randomState
